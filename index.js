@@ -871,10 +871,17 @@ async function showWhy(newId, oldId) {
     if (d.floors.length > shown.length) lines.push(`…还有 ${d.floors.length - shown.length} 楼`);
     if (d.metaKeys.length) lines.push(`聊天设置：${d.metaKeys.map(fieldName).join('、')}`);
     if (!lines.length) lines.push('两份内容完全一样（强制存的）。');
+    const added = d.floors.filter(f => f.change === '新增').length, removed = d.floors.filter(f => f.change === '删除').length;
+    const allFields = d.floors.flatMap(f => f.fields);
     const allBookkeeping = d.floors.every(f => f.change === '修改' && f.fields.length && f.fields.every(k => BOOKKEEPING.has(k))) && d.metaKeys.every(k => BOOKKEEPING.has(k));
-    const note = allBookkeeping
-        ? '这些都是酒馆自己的记账字段（计数、时间戳、标记），不是你改的。'
-        : '正文、swipe、变量这类变化通常来自你的操作或正在跑的脚本（状态栏、变量脚本等）。';
+    const regenerated = allFields.some(k => k === 'gen_finished' || k === 'extra.reasoning_duration' || k === 'swipe_info');
+    const thirdParty = [...new Set([...allFields, ...d.metaKeys].filter(k => !FIELD_NAMES[k] && !BOOKKEEPING.has(k)))];
+    let note;
+    if (added || removed) note = `${added ? `新增 ${added} 楼` : ''}${added && removed ? '，' : ''}${removed ? `删除 ${removed} 楼` : ''}：发消息、收到回复或删楼，其余是跟着来的记账字段。`;
+    else if (allBookkeeping) note = '这些都是酒馆自己的记账字段（计数、时间戳、标记），不是你改的。';
+    else if (regenerated) note = '这一楼重新生成过或换过 swipe（有新的生成时间、思考用时）。';
+    else if (thirdParty.length) note = `${thirdParty.slice(0, 4).join('、')} 不是酒馆自己的字段，是别的扩展或脚本写的${allFields.includes('mes') ? '，而且它连正文也改了' : ''}。`;
+    else note = '正文、swipe、变量这类变化通常来自你的操作或正在跑的脚本（状态栏、变量脚本等）。';
     const c = ctx();
     const st = settings();
     const fields = [...new Set([...d.floors.flatMap(f => f.fields), ...d.metaKeys.map(k => 'meta.' + k)])].filter(k => !k.startsWith('（') && !st.ignore.includes(k)).slice(0, 3);
