@@ -85,3 +85,11 @@
 .ca-dialog p { margin: 0 0 8px; }
 .ca-preview { width: 100%; height: 62vh; font-size: .9em; }
 #ca_drawer .menu_button { width: auto; display: inline-flex; gap: 8px; }
+
+/* 旧插件留下的备份 */
+.ca-legacy { border-left: 3px solid var(--ca-accent); padding-left: 12px; margin-bottom: 22px; }
+.ca-legacy .ca-note { margin: 4px 0 2px; }
+.ca-chat.ca-old { cursor: default; align-items: flex-start; }
+.ca-chat.ca-old .ca-prev { margin: 6px 0 8px; }
+
+.ca-chev { color: var(--ca-muted); }

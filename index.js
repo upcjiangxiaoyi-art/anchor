@@ -46,6 +46,7 @@ const S = {
     sinceMaint: 0,
     blockToastAt: 0,
     dropToast: null,
+    srv: null,                             // 服务器备份列表的缓存 { at, rows }
 };
 
 function settings() {
@@ -564,6 +565,31 @@ async function getSnap(id) {
     return snap;
 }
 
+/** 把一份 .jsonl 文本导入成指定角色下的新聊天，并打开它。返回新聊天的名字。 */
+async function importToCharacter(jsonl, idx) {
+    let c = ctx();
+    const ch = c.characters[idx];
+    // 先切到目标角色：酒馆在第一次打开角色时才建它的聊天目录，目录不存在导入会失败
+    if (c.groupId || String(c.characterId) !== String(idx)) {
+        await c.selectCharacterById(idx);
+        if (!await waitFor(() => !ctx().groupId && String(ctx().characterId) === String(idx))) throw new Error(`没能切到角色「${ch.name}」。请手动打开这个角色，再试一次`);
+        c = ctx();
+    }
+    const fd = new FormData();
+    fd.set('file_type', 'jsonl');
+    fd.set('avatar', new File([jsonl], 'chat-anchor.jsonl', { type: 'application/octet-stream' }));
+    fd.set('avatar_url', ch.avatar);
+    fd.set('user_name', c.name1);
+    fd.set('character_name', ch.name);
+    const r = await fetch('/api/chats/import', { method: 'POST', body: fd, headers: uploadHeaders(), cache: 'no-cache' });
+    const out = r.ok ? await r.json().catch(() => null) : null;
+    const fileName = out?.fileNames?.[0];
+    if (!fileName) throw new Error(`导入失败（HTTP ${r.status}${out?.error ? '，服务器拒绝了这个文件' : ''}）。可以改用「导出」把文件存下来`);
+    const chatName = fileName.replace(/\.jsonl$/i, '');
+    await ctx().openCharacterChat(chatName);
+    return chatName;
+}
+
 /** 恢复成一个新聊天（走酒馆官方的导入接口，不覆盖任何现有文件）。 */
 async function restoreAsNew(id) {
     const snap = await getSnap(id);
@@ -596,23 +622,7 @@ async function restoreAsNew(id) {
         if (ok !== c.POPUP_RESULT.AFFIRMATIVE) return null;
         idx = Number(c.characterId);
     }
-    const ch = c.characters[idx];
-    const fd = new FormData();
-    fd.set('file_type', 'jsonl');
-    fd.set('avatar', new File([buildJsonl(data, { user: c.name1, char: ch.name })], 'chat-anchor.jsonl', { type: 'application/octet-stream' }));
-    fd.set('avatar_url', ch.avatar);
-    fd.set('user_name', c.name1);
-    fd.set('character_name', ch.name);
-    const r = await fetch('/api/chats/import', { method: 'POST', body: fd, headers: uploadHeaders(), cache: 'no-cache' });
-    const out = r.ok ? await r.json() : null;
-    const fileName = out?.fileNames?.[0];
-    if (!fileName) throw new Error(`导入失败（HTTP ${r.status}）。可以改用「导出」把文件存下来`);
-    const chatName = fileName.replace(/\.jsonl$/i, '');
-    if (c.groupId || String(c.characterId) !== String(idx)) {
-        await c.selectCharacterById(idx);
-        if (!await waitFor(() => !ctx().groupId && String(ctx().characterId) === String(idx))) throw new Error(`已导入为「${chatName}」，但没能自动切到角色。请手动打开这个角色的聊天列表`);
-    }
-    await ctx().openCharacterChat(chatName);
+    const chatName = await importToCharacter(buildJsonl(data, { user: c.name1, char: c.characters[idx].name }), idx);
     logEvent('恢复', `快照（${snap.count} 楼）已恢复成新聊天「${chatName}」`);
     return chatName;
 }
@@ -655,15 +665,9 @@ async function restoreInPlace(id) {
     return saved;
 }
 
-const stamp = ts => { const d = new Date(ts); const z = n => String(n).padStart(2, '0'); return `${d.getFullYear()}${z(d.getMonth() + 1)}${z(d.getDate())}-${z(d.getHours())}${z(d.getMinutes())}`; };
-
-async function exportSnap(id) {
-    const snap = await getSnap(id);
-    const rec = await dbGet('chats', snap.chatKey);
-    const data = await loadSnapData(snap);
-    const jsonl = buildJsonl(data, { user: ctx().name1, char: rec?.owner });
-    const name = `${String(rec?.chatName || 'chat').replace(/[\\/:*?"<>|]/g, '_')} ${stamp(snap.ts)}.jsonl`;
-    const file = new File([jsonl], name, { type: 'application/octet-stream' });
+/** 把文本存成文件：手机上走系统分享（可选"存储到文件"），其它情况直接下载。 */
+async function saveFile(name, text) {
+    const file = new File([text], name, { type: 'application/octet-stream' });
     if (/iPhone|iPad|iPod|Android/i.test(navigator.userAgent) && navigator.canShare?.({ files: [file] })) {
         try { await navigator.share({ files: [file], title: name }); return; } catch (e) { if (e?.name === 'AbortError') return; }
     }
@@ -675,24 +679,222 @@ async function exportSnap(id) {
     setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 4000);
 }
 
-async function previewSnap(id) {
-    const snap = await getSnap(id);
-    const data = await loadSnapData(snap);
-    const from = Math.max(0, data.lines.length - 60);
+/** 弹窗显示最后 60 楼。lines 是每楼一条 JSON 字符串。 */
+async function showPreview(lines) {
+    const from = Math.max(0, lines.length - 60);
     const parts = [];
-    for (let i = from; i < data.lines.length; i++) {
-        try { const m = JSON.parse(data.lines[i]); parts.push(`#${i}  ${m.name ?? ''}\n${m.mes ?? ''}`); } catch { /* 跳过坏行 */ }
+    for (let i = from; i < lines.length; i++) {
+        try { const m = JSON.parse(lines[i]); parts.push(`#${i}  ${m.name ?? ''}\n${m.mes ?? ''}`); } catch { /* 跳过坏行 */ }
     }
     const ta = document.createElement('textarea');
     ta.className = 'text_pole ca-preview';
     ta.readOnly = true;
-    ta.value = (from > 0 ? `（共 ${data.lines.length} 楼，这里显示最后 60 楼）\n\n` : '') + parts.join('\n\n\n');
+    ta.value = (from > 0 ? `（共 ${lines.length} 楼，这里显示最后 60 楼）\n\n` : '') + parts.join('\n\n\n');
     const c = ctx();
     await c.callGenericPopup(ta, c.POPUP_TYPE.TEXT, '', { wide: true, large: true, allowVerticalScrolling: true, okButton: '关闭' });
 }
 
+// ───────────────────────── 旧插件「聊天记录快速恢复」留下的备份 ─────────────────────────
+const LEGACY_DB = 'ST_ChatBackup';
+
+/** 只读打开旧插件的库；库不存在时返回 null，并且不会顺手建一个空库。 */
+async function openLegacy() {
+    try {
+        if (indexedDB.databases) { const list = await indexedDB.databases(); if (!list.some(d => d.name === LEGACY_DB)) return null; }
+    } catch { /* 查不了就直接试着打开 */ }
+    return new Promise(resolve => {
+        const rq = indexedDB.open(LEGACY_DB);
+        rq.onupgradeneeded = () => { try { rq.transaction.abort(); } catch { /* 忽略 */ } }; // 库原本不存在：撤销创建
+        rq.onsuccess = () => {
+            const db = rq.result;
+            if (!db.objectStoreNames.contains('backups_meta') || !db.objectStoreNames.contains('backups_content')) { db.close(); resolve(null); return; }
+            resolve(db);
+        };
+        rq.onerror = e => { e.preventDefault?.(); resolve(null); };
+        rq.onblocked = () => resolve(null);
+    });
+}
+async function legacyRead(store, query) {
+    const db = await openLegacy();
+    if (!db) return null;
+    try {
+        return await new Promise((resolve, reject) => {
+            const os = db.transaction([store], 'readonly').objectStore(store);
+            const rq = query ? os.get(query) : os.getAll();
+            rq.onsuccess = () => resolve(rq.result);
+            rq.onerror = () => reject(rq.error);
+        });
+    } finally { db.close(); } // 用完就关，不挡旧插件自己用
+}
+const legacyList = async () => ((await legacyRead('backups_meta')) || []).sort((a, b) => b.timestamp - a.timestamp);
+async function legacyContent(chatKey, timestamp) {
+    const row = await legacyRead('backups_content', [chatKey, Number(timestamp)]);
+    const text = row?.chatFileContent;
+    if (typeof text !== 'string' || !text.trim()) throw new Error('这份旧备份的内容读不出来');
+    return text.trim();
+}
+const legacyLines = text => text.split('\n').slice(1).filter(l => l.trim());
+
+async function legacyExport(chatKey, timestamp) {
+    const meta = await legacyRead('backups_meta', [chatKey, Number(timestamp)]);
+    const text = await legacyContent(chatKey, timestamp);
+    await saveFile(`${String(meta?.chatName || meta?.entityName || 'chat').replace(/[\\/:*?"<>|]/g, '_')} ${stamp(Number(timestamp))}.jsonl`, text);
+}
+
+/** 把旧备份导入成新聊天。目标角色：当前打开的同名角色 > 唯一的同名角色 > 当前打开的角色（会先问）。 */
+async function legacyImport(chatKey, timestamp, { ask = true } = {}) {
+    if (String(chatKey).startsWith('group_')) throw new Error('群聊的旧备份请用「导出」存成文件，再到群聊里用酒馆的「导入聊天」');
+    const meta = await legacyRead('backups_meta', [chatKey, Number(timestamp)]);
+    const text = await legacyContent(chatKey, timestamp);
+    const c = ctx();
+    const hasOpen = !c.groupId && c.characterId !== undefined && c.characterId !== null;
+    const same = [];
+    c.characters.forEach((ch, i) => { if (ch.name === meta?.entityName) same.push(i); });
+    let idx = -1;
+    if (hasOpen && same.includes(Number(c.characterId))) idx = Number(c.characterId);
+    else if (same.length === 1) idx = same[0];
+    else if (hasOpen) {
+        if (ask) {
+            const ok = await c.Popup.show.confirm('导入到当前角色？', `这份备份属于「${esc(meta?.entityName || '未知角色')}」，${same.length ? '同名的角色卡不止一张' : '没找到同名的角色卡'}。要导入到当前打开的「${esc(c.name2)}」吗？`);
+            if (ok !== c.POPUP_RESULT.AFFIRMATIVE) return null;
+        }
+        idx = Number(c.characterId);
+    } else throw new Error(`请先打开「${meta?.entityName || '要恢复到的角色'}」，再点导入`);
+    await takeSnapshot('auto').catch(warn);
+    const chatName = await importToCharacter(text, idx);
+    logEvent('恢复', `旧插件的备份（${legacyLines(text).length} 楼）已导入成新聊天「${chatName}」`);
+    return chatName;
+}
+
+const stamp = ts => { const d = new Date(ts); const z = n => String(n).padStart(2, '0'); return `${d.getFullYear()}${z(d.getMonth() + 1)}${z(d.getDate())}-${z(d.getHours())}${z(d.getMinutes())}`; };
+
+async function exportSnap(id) {
+    const snap = await getSnap(id);
+    const rec = await dbGet('chats', snap.chatKey);
+    const data = await loadSnapData(snap);
+    const jsonl = buildJsonl(data, { user: ctx().name1, char: rec?.owner });
+    const name = `${String(rec?.chatName || 'chat').replace(/[\\/:*?"<>|]/g, '_')} ${stamp(snap.ts)}.jsonl`;
+    await saveFile(name, jsonl);
+}
+
+async function previewSnap(id) {
+    const snap = await getSnap(id);
+    const data = await loadSnapData(snap);
+    await showPreview(data.lines);
+}
+
+// ───────────────────────── 服务器上的备份（酒馆自带，data/<用户>/backups/） ─────────────────────────
+// 和在宝塔 / 1Panel 里翻 backups 文件夹看到的是同一批文件，这里通过酒馆自己的接口读，不需要面板。
+
+/** 纯 JS 的 SHA-256：云酒馆常用 http 访问，那种环境下浏览器不提供 crypto.subtle。 */
+function sha256Hex(str) {
+    const K = [], H = [], comp = {};
+    for (let n = 2, c = 0; c < 64; n++) {
+        if (comp[n]) continue;
+        for (let i = n * 2; i < 320; i += n) comp[i] = true;
+        if (c < 8) H[c] = (Math.pow(n, 0.5) * 4294967296) | 0;
+        K[c++] = (Math.pow(n, 1 / 3) * 4294967296) | 0;
+    }
+    const bytes = new TextEncoder().encode(str);
+    const len = bytes.length;
+    const total = ((len + 9 + 63) >> 6) << 6;
+    const buf = new Uint8Array(total);
+    buf.set(bytes);
+    buf[len] = 0x80;
+    const dv = new DataView(buf.buffer);
+    dv.setUint32(total - 8, Math.floor(len / 536870912));
+    dv.setUint32(total - 4, (len * 8) >>> 0);
+    const w = new Int32Array(64);
+    const rot = (x, n) => (x >>> n) | (x << (32 - n));
+    for (let off = 0; off < total; off += 64) {
+        for (let i = 0; i < 16; i++) w[i] = dv.getInt32(off + i * 4);
+        for (let i = 16; i < 64; i++) {
+            const a = w[i - 15], b = w[i - 2];
+            w[i] = (w[i - 16] + (rot(a, 7) ^ rot(a, 18) ^ (a >>> 3)) + w[i - 7] + (rot(b, 17) ^ rot(b, 19) ^ (b >>> 10))) | 0;
+        }
+        let [a, b, c, d, e, f, g, h] = H;
+        for (let i = 0; i < 64; i++) {
+            const t1 = (h + (rot(e, 6) ^ rot(e, 11) ^ rot(e, 25)) + ((e & f) ^ (~e & g)) + K[i] + w[i]) | 0;
+            const t2 = ((rot(a, 2) ^ rot(a, 13) ^ rot(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) | 0;
+            h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
+        }
+        H[0] = (H[0] + a) | 0; H[1] = (H[1] + b) | 0; H[2] = (H[2] + c) | 0; H[3] = (H[3] + d) | 0;
+        H[4] = (H[4] + e) | 0; H[5] = (H[5] + f) | 0; H[6] = (H[6] + g) | 0; H[7] = (H[7] + h) | 0;
+    }
+    return H.map(x => (x >>> 0).toString(16).padStart(8, '0')).join('');
+}
+
+/** 和服务器 src/endpoints/chats.js 的 getBackupKey 保持一致：角色卡文件名 → 备份文件名里的那一段。 */
+function backupKeyOf(cardName, withHash = true) {
+    const clean = String(cardName).replace(/[/?<>\\:*|"]/g, '').replace(/[\x00-\x1f\x80-\x9f]/g, '').replace(/[. ]+$/, '');
+    const plain = clean.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+    return withHash && /[^\x20-\x7E]/.test(cardName) ? `${plain}_${sha256Hex(String(cardName)).slice(0, 8)}` : plain;
+}
+
+/** 备份文件名里的那一段 → 是哪张角色卡。 */
+function backupOwners() {
+    const exact = new Map(), loose = new Map();
+    ctx().characters.forEach((ch, idx) => {
+        const card = String(ch.avatar || '').replace('.png', '');
+        if (!card) return;
+        exact.set(backupKeyOf(card), { idx, name: ch.name });
+        const k = backupKeyOf(card, false); // 旧版酒馆的文件名不带哈希，可能多张卡撞名
+        loose.set(k, loose.has(k) ? null : { idx, name: ch.name });
+    });
+    return key => exact.get(key) || loose.get(key) || null;
+}
+
+async function serverBackups(force = false) {
+    if (!force && S.srv && Date.now() - S.srv.at < 120000) return S.srv.rows;
+    const r = await fetch('/api/backups/chat/get', { method: 'POST', headers: ctx().getRequestHeaders() });
+    if (r.status === 404) throw new Error('这个版本的酒馆没有备份接口，需要 1.17 或更新');
+    if (!r.ok) throw new Error(`读取服务器备份失败（HTTP ${r.status}）`);
+    const rows = [];
+    for (const b of await r.json()) {
+        const m = /^chat_(.*)_(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})\.jsonl$/.exec(b?.file_name || '');
+        if (!m) continue;
+        rows.push({
+            file: b.file_name, key: m[1], count: Number(b.chat_items) || 0, size: String(b.file_size || ''),
+            order: Number(m.slice(2).join('')), when: `${Number(m[3])}月${Number(m[4])}日 ${m[5]}:${m[6]}`,
+            preview: String(b.mes || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 140),
+        });
+    }
+    rows.sort((a, b) => b.order - a.order);
+    S.srv = { at: Date.now(), rows };
+    return rows;
+}
+
+async function serverText(file) {
+    const r = await fetch('/api/backups/chat/download', { method: 'POST', headers: ctx().getRequestHeaders(), body: JSON.stringify({ name: file }) });
+    if (!r.ok) throw new Error(`下载备份失败（HTTP ${r.status}）`);
+    const text = (await r.text()).trim();
+    if (!text) throw new Error('这份备份是空的');
+    return text;
+}
+
+/** 把服务器上的一份备份导入成新聊天。认得出是哪张卡就导给它，认不出就问要不要导到当前角色。 */
+async function serverRestore(file, { ask = true } = {}) {
+    const m = /^chat_(.*)_\d{8}-\d{6}\.jsonl$/.exec(file);
+    const owner = m ? backupOwners()(m[1]) : null;
+    const c = ctx();
+    let idx = owner ? owner.idx : -1;
+    if (idx < 0) {
+        if (c.groupId || c.characterId === undefined || c.characterId === null) throw new Error('认不出这份备份属于哪张角色卡。请先打开要恢复到的角色，再点恢复');
+        if (ask) {
+            const ok = await c.Popup.show.confirm('导入到当前角色？', `认不出这份备份属于哪张角色卡。要导入到当前打开的「${esc(c.name2)}」吗？`);
+            if (ok !== c.POPUP_RESULT.AFFIRMATIVE) return null;
+        }
+        idx = Number(c.characterId);
+    }
+    const text = await serverText(file);
+    await takeSnapshot('auto').catch(warn);
+    const chatName = await importToCharacter(text, idx);
+    logEvent('恢复', `服务器备份 ${file}（${legacyLines(text).length} 楼）已导入成新聊天「${chatName}」`);
+    return chatName;
+}
+
 // ───────────────────────── 面板 ─────────────────────────
-const P = { popup: null, root: null, tab: 'cur', viewKey: null, busy: false, again: false };
+const P = { popup: null, root: null, tab: 'cur', viewKey: null, srvKey: undefined, busy: false, again: false };
 const REASON = { manual: '手动', drop: '掉楼前', 'pre-restore': '恢复前' };
 const z2 = n => String(n).padStart(2, '0');
 const fmtTime = ts => { const d = new Date(ts); return `${z2(d.getHours())}:${z2(d.getMinutes())}`; };
@@ -740,10 +942,11 @@ async function render() {
     let body;
     if (P.tab === 'cur') body = await renderTimeline(info?.key, info, false);
     else if (P.tab === 'all') body = P.viewKey ? await renderTimeline(P.viewKey, info, true) : await renderChats(info);
+    else if (P.tab === 'srv') body = await renderServer(info);
     else if (P.tab === 'log') body = await renderLog();
     else body = await renderSettings();
     if (P.root !== root) return;
-    const tabs = [['cur', '当前聊天'], ['all', '全部聊天'], ['log', '记录'], ['set', '设置']];
+    const tabs = [['cur', '当前'], ['all', '全部'], ['srv', '服务器'], ['log', '记录'], ['set', '设置']];
     const scroller = root.closest('.popup-content') || root.parentElement;
     const top = scroller?.scrollTop ?? 0;
     root.innerHTML = `
@@ -800,15 +1003,76 @@ async function renderTimeline(key, info, withBack) {
     return html;
 }
 
+async function renderLegacy() {
+    let rows = [];
+    try { rows = await legacyList(); } catch (e) { warn('读取旧插件备份失败', e); }
+    if (!rows.length) return '';
+    return `<div class="ca-legacy"><div class="ca-chat-name">旧插件留下的备份</div>
+        <div class="ca-note">来自「聊天记录快速恢复」。建议先点导出把文件存下来，再导入。</div>
+        <ul class="ca-chats">${rows.map(r => `<li class="ca-chat ca-old" data-lk="${esc(r.chatKey)}" data-lt="${esc(r.timestamp)}">
+            <div class="ca-chat-main"><div class="ca-chat-name">${esc(r.entityName)}</div>
+            <div class="ca-chat-file">${esc(r.chatName)}</div>
+            <div class="ca-chat-meta">${Number(r.lastMessageId) + 1} 楼，备份于 ${fmtDay(r.timestamp)} ${fmtTime(r.timestamp)}</div>
+            <div class="ca-prev">${esc(String(r.lastMessagePreview || '').slice(0, 140))}</div>
+            <div class="ca-acts"><div class="menu_button" data-act="old-export">导出文件</div><div class="menu_button" data-act="old-import">导入成新聊天</div>
+            <button type="button" class="ca-icon" data-act="old-preview" title="预览最后 60 楼" aria-label="预览"><i class="fa-solid fa-eye"></i></button></div></div>
+        </li>`).join('')}</ul></div>`;
+}
+
 async function renderChats(info) {
+    const legacy = await renderLegacy();
     const chats = (await dbAll('chats')).sort((a, b) => b.lastTs - a.lastTs);
-    if (!chats.length) return '<div class="ca-empty">还没有任何快照。<br>打开一个聊天聊几句就有了。</div>';
-    return '<ul class="ca-chats">' + chats.map(r => `<li class="ca-chat" data-act="view" data-key="${esc(r.chatKey)}">
+    if (!chats.length) return legacy || '<div class="ca-empty">还没有任何快照。<br>打开一个聊天聊几句就有了。</div>';
+    return legacy + '<ul class="ca-chats">' + chats.map(r => `<li class="ca-chat" data-act="view" data-key="${esc(r.chatKey)}">
         <div class="ca-chat-main"><div class="ca-chat-name">${esc(r.owner)}${r.chatKey === info?.key ? '（当前）' : ''}</div>
         <div class="ca-chat-file">${esc(r.chatName)}</div>
         <div class="ca-chat-meta">${r.lastCount} 楼，最后快照 ${fmtDay(r.lastTs)} ${fmtTime(r.lastTs)}${r.alert ? '，有一次掉楼记录' : ''}</div></div>
         <button type="button" class="ca-icon" data-act="del-chat" data-key="${esc(r.chatKey)}" title="删除这个聊天的全部快照" aria-label="删除"><i class="fa-solid fa-trash-can"></i></button>
     </li>`).join('') + '</ul>';
+}
+
+async function renderServer(info) {
+    let rows;
+    try { rows = await serverBackups(); }
+    catch (e) { return `<div class="ca-empty">${esc(e?.message || e)}</div><div class="ca-banner-acts"><div class="menu_button" data-act="srv-refresh">再试一次</div></div>`; }
+    const ownerOf = backupOwners();
+    const groups = new Map();
+    for (const r of rows) { if (!groups.has(r.key)) groups.set(r.key, []); groups.get(r.key).push(r); }
+    const head = `<div class="ca-note">酒馆自己存在服务器上的备份，每个角色留最近 50 份。和在宝塔、1Panel 里翻 backups 文件夹看到的是同一批文件。时间按服务器的时钟。</div>
+        <div class="ca-banner-acts"><div class="menu_button" data-act="srv-refresh">刷新</div></div>`;
+    if (!groups.size) return head + '<div class="ca-empty">服务器上没有聊天备份。<br>可能是酒馆配置里关掉了备份。</div>';
+
+    if (P.srvKey === undefined) { // 默认打开当前角色
+        const card = info?.kind === 'c' ? String(info.avatar).replace('.png', '') : null;
+        const mine = card && [backupKeyOf(card), backupKeyOf(card, false)].find(k => groups.has(k));
+        P.srvKey = mine || null;
+    }
+    if (P.srvKey && groups.has(P.srvKey)) {
+        const list = groups.get(P.srvKey);
+        const owner = ownerOf(P.srvKey);
+        let html = `${head}<button type="button" class="ca-back" data-act="srv-back"><i class="fa-solid fa-chevron-left"></i>全部角色</button>
+            <div class="ca-chat-name">${owner ? esc(owner.name) : '认不出的角色'}</div><div class="ca-chat-file">这个角色下所有聊天的备份都在这里，共 ${list.length} 份</div><ol class="ca-line">`;
+        list.forEach((r, i) => {
+            const older = list[i + 1], newer = list[i - 1];
+            const delta = older ? r.count - older.count : 0;
+            const before = !!newer && r.count >= 10 && newer.count <= r.count / 2; // 下一份突然少了一半以上
+            html += `<li class="ca-snap${before ? ' is-locked is-drop' : ''}" data-file="${esc(r.file)}">
+                <div class="ca-snap-head"><time>${r.when}</time><span class="ca-floors">${r.count} 楼</span>${delta ? `<span class="ca-delta${delta < 0 ? ' is-neg' : ''}">${delta > 0 ? '+' : '−'}${Math.abs(delta)}</span>` : ''}${before ? '<span class="ca-tag">掉楼前</span>' : ''}</div>
+                <div class="ca-prev">${esc(r.preview) || '（空消息）'}　${esc(r.size)}</div>
+                <div class="ca-acts"><div class="menu_button" data-act="srv-restore">恢复成新聊天</div>
+                <button type="button" class="ca-icon" data-act="srv-preview" title="预览最后 60 楼" aria-label="预览"><i class="fa-solid fa-eye"></i></button>
+                <button type="button" class="ca-icon" data-act="srv-export" title="导出 .jsonl 文件" aria-label="导出"><i class="fa-solid fa-file-export"></i></button></div></li>`;
+        });
+        return html + '</ol>';
+    }
+    P.srvKey = null;
+    return head + '<ul class="ca-chats">' + [...groups.entries()].map(([key, list]) => {
+        const owner = ownerOf(key);
+        return `<li class="ca-chat" data-act="srv-view" data-skey="${esc(key)}"><div class="ca-chat-main">
+            <div class="ca-chat-name">${owner ? esc(owner.name) : '认不出的角色'}</div>
+            <div class="ca-chat-meta">${list.length} 份备份，最多 ${Math.max(...list.map(r => r.count))} 楼，最近一份 ${list[0].when}</div>
+            ${owner ? '' : `<div class="ca-prev">${esc(list[0].preview)}</div>`}</div><i class="fa-solid fa-chevron-right ca-chev"></i></li>`;
+    }).join('') + '</ul>';
 }
 
 async function renderLog() {
@@ -859,7 +1123,11 @@ async function onPanelClick(e) {
     const id = el.dataset.id || el.closest('[data-id]')?.dataset.id;
     const yes = async (title, text) => (await c.Popup.show.confirm(title, text)) === c.POPUP_RESULT.AFFIRMATIVE;
 
-    if (act === 'tab') { P.tab = el.dataset.tab; P.viewKey = null; return refreshPanel(); }
+    if (act === 'tab') {
+        P.tab = el.dataset.tab; P.viewKey = null; P.srvKey = undefined;
+        if (P.tab === 'srv' && !S.srv) { const b = P.root.querySelector('.ca-body'); if (b) b.innerHTML = '<div class="ca-empty">正在读取服务器上的备份…</div>'; }
+        return refreshPanel();
+    }
     if (act === 'back') { P.viewKey = null; return refreshPanel(); }
     if (act === 'view') { P.viewKey = el.dataset.key; return refreshPanel(); }
     if (act === 'reload') { await closePanel(); return ctx().reloadCurrentChat(); }
@@ -894,6 +1162,34 @@ async function onPanelClick(e) {
         if (!await yes('删除这个聊天的全部快照？', '只删快照，服务器上的聊天不受影响。')) return;
         await enqueue(() => deleteChatData(el.dataset.key));
         return refreshPanel();
+    }
+    if (act === 'srv-refresh') { S.srv = null; return refreshPanel(); }
+    if (act === 'srv-back') { P.srvKey = null; return refreshPanel(); }
+    if (act === 'srv-view') { P.srvKey = el.dataset.skey; return refreshPanel(); }
+    if (act.startsWith('srv-')) {
+        const file = el.closest('[data-file]')?.dataset.file;
+        if (!file) return;
+        if (act === 'srv-preview') return showPreview(legacyLines(await serverText(file)));
+        if (act === 'srv-export') return saveFile(file, await serverText(file));
+        if (act === 'srv-restore') {
+            const pop = P.popup;
+            const name = await serverRestore(file);
+            if (name) { S.srv = null; if (P.popup === pop) await closePanel(); toast('success', `已恢复成新聊天「${name}」。`); }
+        }
+        return;
+    }
+    if (act.startsWith('old-')) {
+        const li = el.closest('[data-lk]');
+        const lk = li?.dataset.lk, lt = li?.dataset.lt;
+        if (!lk) return;
+        if (act === 'old-export') return legacyExport(lk, lt);
+        if (act === 'old-preview') return showPreview(legacyLines(await legacyContent(lk, lt)));
+        if (act === 'old-import') {
+            const pop = P.popup;
+            const name = await legacyImport(lk, lt);
+            if (name) { if (P.popup === pop) await closePanel(); toast('success', `已导入成新聊天「${name}」。`); }
+        }
+        return;
     }
     if (!id) return;
     if (act === 'preview') return previewSnap(id);
@@ -998,5 +1294,7 @@ globalThis.ChatAnchor = {
     list: async key => snapsOf(key || currentChat()?.key),
     stats: async () => ({ chats: (await dbAll('chats')).length, snaps: (await dbAll('snaps')).length, blobs: (await blobKeysOf(currentChat()?.key)).length }),
     log: () => dbAll('log'),
+    legacy: { list: legacyList, importAsNew: legacyImport, exportFile: legacyExport },
+    server: { list: serverBackups, restore: serverRestore, keyOf: backupKeyOf, sha256: sha256Hex },
     state: S,
 };
