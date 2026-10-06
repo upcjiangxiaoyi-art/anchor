@@ -780,6 +780,88 @@ async function legacyImport(chatKey, timestamp, { ask = true } = {}) {
     return chatName;
 }
 
+// ───────────────────────── 两份快照差在哪 ─────────────────────────
+const FIELD_NAMES = {
+    mes: '正文', swipe_id: '当前是第几个 swipe', swipes: 'swipe 列表', swipe_info: 'swipe 附带信息', name: '名字', send_date: '发送时间',
+    gen_started: '生成开始时间', gen_finished: '生成结束时间', is_user: '是否用户发言', is_system: '是否系统消息', force_avatar: '头像',
+    'extra.token_count': 'token 计数', 'extra.reasoning': '思维链', 'extra.reasoning_duration': '思考用时', 'extra.display_text': '显示文本',
+    'extra.api': '接口', 'extra.model': '模型', 'extra.image': '图片', 'extra.title': '标题', 'extra.bias': '偏置', 'extra.memory': '摘要',
+    variables: '变量', tainted: '已改动标记', lastInContextMessageId: '上下文范围标记', integrity: '校验码', note_prompt: '作者注释',
+    note_interval: '作者注释频率', note_depth: '作者注释深度', note_position: '作者注释位置', timedWorldInfo: '世界书定时',
+    chat_id_hash: '聊天标识', main_chat: '主聊天', scenario: '场景', system_prompt: '系统提示', mes_example: '对话示例',
+};
+const fieldName = k => FIELD_NAMES[k] ? `${FIELD_NAMES[k]}（${k}）` : k;
+const BOOKKEEPING = new Set(['gen_started', 'gen_finished', 'extra.token_count', 'extra.reasoning_duration', 'extra.api', 'extra.model', 'send_date', 'lastInContextMessageId', 'tainted']);
+
+function keysDiff(x, y) {
+    const out = [];
+    for (const k of new Set([...Object.keys(x || {}), ...Object.keys(y || {})])) {
+        const vx = x?.[k], vy = y?.[k];
+        if (JSON.stringify(vx) === JSON.stringify(vy)) continue;
+        if (k === 'extra' && vx && vy && typeof vx === 'object' && typeof vy === 'object') { for (const e of new Set([...Object.keys(vx), ...Object.keys(vy)])) if (JSON.stringify(vx[e]) !== JSON.stringify(vy[e])) out.push('extra.' + e); }
+        else out.push(k);
+    }
+    return out;
+}
+
+/** 新快照相对旧快照改了什么。不读数据库，只比哈希：用来在列表里写一句话。 */
+function describeChange(s, older) {
+    if (!older) return null;
+    if (s.count !== older.count) return { kind: 'count', text: `${s.count > older.count ? '+' : '−'}${Math.abs(s.count - older.count)}` };
+    const changed = [];
+    for (let i = 0; i < s.hashes.length; i++) if (s.hashes[i] !== older.hashes[i]) changed.push(i);
+    if (changed.length === 1) return { kind: 'floor', text: `改了第 ${changed[0] + 1} 楼` };
+    if (changed.length > 1) return { kind: 'floor', text: `改了 ${changed.length} 楼` };
+    if (s.meta !== older.meta) return { kind: 'meta', text: '只有聊天设置变了' };
+    return { kind: 'same', text: '内容相同' };
+}
+
+/** 两份快照逐楼、逐字段地比。返回 { floors: [{ index, change, fields }], metaKeys } */
+async function diffSnaps(newId, oldId) {
+    const [a, b] = await Promise.all([getSnap(newId), getSnap(oldId)]);
+    if (a.chatKey !== b.chatKey) throw new Error('两份快照不属于同一个聊天');
+    const n = Math.max(a.hashes.length, b.hashes.length);
+    const want = new Set();
+    for (let i = 0; i < n; i++) if (a.hashes[i] !== b.hashes[i]) { want.add(a.hashes[i]); want.add(b.hashes[i]); }
+    if (a.meta !== b.meta) { want.add(a.meta); want.add(b.meta); }
+    want.delete(undefined);
+    const map = await tx(['blobs'], 'readonly', t => {
+        const m = new Map();
+        const st = t.objectStore('blobs');
+        for (const h of want) st.get([a.chatKey, h]).onsuccess = e => { if (e.target.result) m.set(h, e.target.result.json); };
+        return m;
+    });
+    const parse = h => { try { return JSON.parse(map.get(h)); } catch { return null; } };
+    const out = { from: b.count, to: a.count, floors: [], metaKeys: [] };
+    for (let i = 0; i < n; i++) {
+        if (a.hashes[i] === b.hashes[i]) continue;
+        if (i >= a.hashes.length) { out.floors.push({ index: i, change: '删除', fields: [] }); continue; }
+        if (i >= b.hashes.length) { out.floors.push({ index: i, change: '新增', fields: [] }); continue; }
+        const x = parse(a.hashes[i]), y = parse(b.hashes[i]);
+        out.floors.push({ index: i, change: '修改', fields: x && y ? keysDiff(x, y) : ['（内容读不出来）'] });
+    }
+    if (a.meta !== b.meta) out.metaKeys = keysDiff(parse(a.meta), parse(b.meta));
+    return out;
+}
+
+async function showWhy(newId, oldId) {
+    const [d, a, b] = await Promise.all([diffSnaps(newId, oldId), getSnap(newId), getSnap(oldId)]);
+    const lines = [];
+    const shown = d.floors.slice(0, 20);
+    for (const f of shown) lines.push(`第 ${f.index + 1} 楼 ${f.change}${f.fields.length ? '：' + f.fields.map(fieldName).join('、') : ''}`);
+    if (d.floors.length > shown.length) lines.push(`…还有 ${d.floors.length - shown.length} 楼`);
+    if (d.metaKeys.length) lines.push(`聊天设置：${d.metaKeys.map(fieldName).join('、')}`);
+    if (!lines.length) lines.push('两份内容完全一样（强制存的）。');
+    const allBookkeeping = d.floors.every(f => f.change === '修改' && f.fields.length && f.fields.every(k => BOOKKEEPING.has(k))) && d.metaKeys.every(k => BOOKKEEPING.has(k));
+    const note = allBookkeeping
+        ? '这些都是酒馆自己的记账字段（计数、时间戳、标记），不是你改的。'
+        : '正文、swipe、变量这类变化通常来自你的操作或正在跑的脚本（状态栏、变量脚本等）。';
+    const c = ctx();
+    const html = `<div class="ca-dialog"><h3>${fmtDay(a.ts)} ${fmtTime(a.ts)} 这份比 ${fmtDay(b.ts)} ${fmtTime(b.ts)} 那份</h3>
+        <p>${lines.map(esc).join('<br>')}</p><p class="ca-note">${note}</p></div>`;
+    await c.callGenericPopup(html, c.POPUP_TYPE.TEXT, '', { okButton: '关闭', allowVerticalScrolling: true });
+}
+
 const stamp = ts => { const d = new Date(ts); const z = n => String(n).padStart(2, '0'); return `${d.getFullYear()}${z(d.getMonth() + 1)}${z(d.getDate())}-${z(d.getHours())}${z(d.getMinutes())}`; };
 
 async function exportSnap(id) {
@@ -958,7 +1040,7 @@ async function serverRestore(file, { ask = true } = {}) {
 
 // ───────────────────────── 面板 ─────────────────────────
 const P = { popup: null, root: null, tab: 'cur', viewKey: null, srvKey: undefined, busy: false, again: false, srvTick: null };
-const REASON = { manual: '手动', drop: '掉楼前', 'pre-restore': '恢复前' };
+const REASON = { manual: '手动', drop: '掉楼前', 'pre-restore': '恢复前', hidden: '切后台时' };
 const z2 = n => String(n).padStart(2, '0');
 const fmtTime = ts => { const d = new Date(ts); return `${z2(d.getHours())}:${z2(d.getMinutes())}`; };
 function fmtDay(ts) {
@@ -1048,8 +1130,8 @@ async function renderTimeline(key, info, withBack) {
         const d = fmtDay(s.ts);
         if (d !== day) { if (open) html += '</ol>'; html += `<div class="ca-day">${d}</div><ol class="ca-line">`; open = true; day = d; }
         const older = snaps[i + 1];
-        const delta = older ? s.count - older.count : 0;
-        const deltaHtml = delta ? `<span class="ca-delta${delta < 0 ? ' is-neg' : ''}">${delta > 0 ? '+' : '−'}${Math.abs(delta)}</span>` : '';
+        const ch = describeChange(s, older);
+        const deltaHtml = ch ? `<button type="button" class="ca-delta ca-why${ch.kind === 'count' && s.count < older.count ? ' is-neg' : ''}" data-act="why" data-prev="${esc(older.id)}" title="看看改了什么">${esc(ch.text)}</button>` : '';
         const tag = REASON[s.lockReason] || REASON[s.reason] || (s.locked ? '已锁定' : '');
         html += `<li class="ca-snap${s.locked ? ' is-locked' : ''}${s.lockReason === 'drop' ? ' is-drop' : ''}" data-id="${esc(s.id)}">
             <div class="ca-snap-head"><time>${fmtTime(s.ts)}</time><span class="ca-floors">${s.count} 楼</span>${deltaHtml}${tag ? `<span class="ca-tag">${tag}</span>` : ''}</div>
@@ -1284,6 +1366,7 @@ async function onPanelClick(e) {
         return;
     }
     if (!id) return;
+    if (act === 'why') return showWhy(id, el.dataset.prev);
     if (act === 'preview') return previewSnap(id);
     if (act === 'export') return exportSnap(id);
     if (act === 'lock') {
@@ -1362,8 +1445,8 @@ function start() {
         on(name, () => schedule(1200));
     }
     // 切到后台前立刻存一份：手机上页面随时可能被系统回收
-    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden' && settings().enabled) { clearTimeout(S.timer); S.timer = null; takeSnapshot('auto').catch(warn); } });
-    window.addEventListener('pagehide', () => { if (S.timer) { clearTimeout(S.timer); S.timer = null; takeSnapshot('auto').catch(warn); } });
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden' && settings().enabled) { clearTimeout(S.timer); S.timer = null; takeSnapshot('hidden').catch(warn); } });
+    window.addEventListener('pagehide', () => { if (S.timer) { clearTimeout(S.timer); S.timer = null; takeSnapshot('hidden').catch(warn); } });
     window.addEventListener('online', () => { const k = currentChat()?.key; const ls = k && S.lastSave.get(k); if (ls && !ls.ok && settings().retrySave) ctx().saveChat(); });
 
     try { navigator.storage?.persist?.().catch(() => { }); } catch { /* 不支持就算了 */ }
@@ -1386,6 +1469,7 @@ globalThis.ChatAnchor = {
     list: async key => snapsOf(key || currentChat()?.key),
     stats: async () => ({ chats: (await dbAll('chats')).length, snaps: (await dbAll('snaps')).length, blobs: (await blobKeysOf(currentChat()?.key)).length }),
     log: () => dbAll('log'),
+    diff: diffSnaps,
     legacy: { list: legacyList, importAsNew: legacyImport, exportFile: legacyExport },
     server: { list: serverBackups, restore: serverRestore, keyOf: backupKeyOf, sha256: sha256Hex },
     state: S,
