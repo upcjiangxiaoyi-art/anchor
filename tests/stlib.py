@@ -403,6 +403,12 @@ def ensure_group(page, chat_id):
     """没有测试群就建一个（成员：Seraphina + Bob），当前聊天指向 chat_id。返回群 id。"""
     g = ev(page, 'return ctx.groups.find(g => g.name === arg) || null;', GROUP_NAME)
     if g:
+        # 上一轮测试的「恢复成新聊天」会把群的当前聊天指到别的文件，这里指回来
+        if g.get('chat_id') != chat_id or chat_id not in (g.get('chats') or []):
+            ev(page, '''const g = ctx.groups.find(x => x.id === arg.id);
+                g.chat_id = arg.chat_id; g.chats = [...new Set([...(g.chats || []), arg.chat_id])];
+                const r = await fetch('/api/groups/edit', { method: 'POST', headers: ctx.getRequestHeaders(), body: JSON.stringify(g) });
+                if (!r.ok) throw new Error('edit group ' + r.status);''', {'id': g['id'], 'chat_id': chat_id})
         return g['id']
     av2 = ensure_member2(page)
     g = ev(page, '''const r = await fetch('/api/groups/create', { method: 'POST', headers: ctx.getRequestHeaders(), body: JSON.stringify({

@@ -49,7 +49,7 @@ const S = {
     srv: null,                             // 服务器备份列表的缓存 { at, rows }
     srvJob: null,                          // 正在进行的服务器列表读取 { promise, startedAt, controller }
     srvLast: null,                         // 上一次读取的结果 { at, error }
-    srvTimeoutMs: 90000,                   // 服务器列表读取超时
+    srvTimeoutMs: 300000,                  // 服务器列表读取超时（5 分钟；有反代的话反代一般 60 秒就先返回 504）
 };
 
 function settings() {
@@ -862,8 +862,26 @@ function backupOwners() {
  * 读取服务器上的备份列表。酒馆这个接口会把 backups 目录里每一份都读一遍，备份多时要等很久，
  * 所以：同一时刻只发一个请求；有超时；读到就缓存 10 分钟；失败时留着上一次的结果；面板从不 await 它。
  */
+const SRV_CACHE_KEY = 'chat_anchor_srv_list';
+const SRV_TTL = 1800000; // 30 分钟内不自动重读
+
+/** 读到过的列表记在 localStorage：读一次很贵，刷新页面后也不用重读。存不下或读不到都当没有。 */
+function loadSrvCache() {
+    if (S.srv) return;
+    try {
+        const v = JSON.parse(localStorage.getItem(SRV_CACHE_KEY) || 'null');
+        if (v && Array.isArray(v.rows) && v.at) S.srv = { at: v.at, rows: v.rows, cached: true };
+    } catch { /* 读不到就当没有 */ }
+}
+function saveSrvCache(at, rows) {
+    try { localStorage.setItem(SRV_CACHE_KEY, JSON.stringify({ at, rows: rows.map(r => ({ ...r, preview: r.preview.slice(0, 60) })) })); }
+    catch { /* 存不下就算了 */ }
+}
+const srvIsSlowError = msg => /HTTP 50[234]|秒服务器还没/.test(String(msg || ''));
+
 function serverBackups(force = false) {
-    if (!force && S.srv && Date.now() - S.srv.at < 600000) return Promise.resolve(S.srv.rows);
+    loadSrvCache();
+    if (!force && S.srv && Date.now() - S.srv.at < SRV_TTL) return Promise.resolve(S.srv.rows);
     if (S.srvJob) return S.srvJob.promise;
     const controller = typeof AbortController === 'function' ? new AbortController() : null;
     const job = { startedAt: Date.now(), controller, promise: null };
@@ -874,6 +892,7 @@ function serverBackups(force = false) {
         try {
             const r = await fetch('/api/backups/chat/get', { method: 'POST', headers: ctx().getRequestHeaders(), signal: controller?.signal });
             if (r.status === 404) throw new Error('这个版本的酒馆没有备份接口，需要 1.17 或更新');
+            if (r.status === 504 || r.status === 502) throw new Error(`反向代理没等到酒馆的回应就放弃了（HTTP ${r.status}）`);
             if (!r.ok) throw new Error(`读取服务器备份失败（HTTP ${r.status}）`);
             const list = await r.json().catch(() => null);
             if (!Array.isArray(list)) throw new Error('服务器返回的不是备份列表');
@@ -889,6 +908,7 @@ function serverBackups(force = false) {
             }
             rows.sort((a, b) => b.order - a.order);
             S.srv = { at: Date.now(), rows };
+            saveSrvCache(S.srv.at, rows);
             return rows;
         } catch (e) {
             error = e?.name === 'AbortError'
@@ -1089,19 +1109,30 @@ function tickServerWait() {
     }, 1000);
 }
 
+/** 读不出来（504 / 超时）时给的处理办法：小锚改不了服务器，只能告诉用户怎么把目录弄小。 */
+const SRV_SLOW_HELP = `<div class="ca-note">这说明酒馆在服务器上读备份目录读了太久：每张卡留 50 份，每份都是整个聊天的完整副本，目录一大酒馆就要读好几分钟，反向代理（宝塔 / 1Panel / 云平台）一般等 60 秒就放弃。小锚改不了服务器，能做的是：<br>
+1. 到宝塔 / 1Panel 的文件管理打开 酒馆/data/&lt;用户&gt;/backups/，按时间排序，把旧的 chat_*.jsonl 删掉一批（只是备份，不影响聊天本身）。<br>
+2. 酒馆目录下 config.yaml：backups.common.numberOfBackups 从 50 改成 10，backups.chat.maxTotalBackups 从 -1 改成 200，重启酒馆，然后随便发一条消息：酒馆会在这次保存时自动把目录裁到 200 份，以后也不会再长大。做了这步第 1 步可以不做。<br>
+3. 反代配置里把 proxy_read_timeout 加到 300 秒。<br>
+点「再试一次」前先等两分钟：代理放弃了，酒馆可能还在读上一次的。</div>`;
+
 async function renderServer(info) {
-    if (!S.srv && !S.srvJob && !S.srvLast?.error) serverBackups().catch(() => { }); // 第一次打开：后台去读，错误记在 S.srvLast
+    loadSrvCache();
+    const stale = !S.srv || Date.now() - S.srv.at > SRV_TTL;
+    if (stale && !S.srvJob && !S.srvLast?.error) serverBackups().catch(() => { }); // 没有或过期：后台去读，错误记在 S.srvLast
     if (!S.srv) {
         if (S.srvJob) {
             tickServerWait();
             return `${SRV_HEAD}<div class="ca-empty">正在读取服务器上的备份… <span data-srv-wait></span><br>酒馆要把服务器上每一份备份都读一遍，备份多就慢。可以先去别的页，读完会自动显示。</div>`;
         }
-        return `${SRV_HEAD}<div class="ca-empty">${esc(S.srvLast?.error || '还没有读取')}</div><div class="ca-banner-acts"><div class="menu_button" data-act="srv-refresh">再试一次</div></div>`;
+        const err = S.srvLast?.error;
+        return `${SRV_HEAD}<div class="ca-empty">${esc(err || '还没有读取')}</div>${srvIsSlowError(err) ? SRV_SLOW_HELP : ''}<div class="ca-banner-acts"><div class="menu_button" data-act="srv-refresh">再试一次</div></div>`;
     }
     const rows = S.srv.rows;
     let head = SRV_HEAD;
     if (S.srvJob) { tickServerWait(); head += '<div class="ca-note">正在重新读取… <span data-srv-wait></span></div>'; }
-    else if (S.srvLast?.error && S.srvLast.at > S.srv.at) head += `<div class="ca-note">刚才没刷新成功：${esc(S.srvLast.error)}。下面是上一次读到的列表。</div>`;
+    else if (S.srvLast?.error && S.srvLast.at > S.srv.at) head += `<div class="ca-note">刚才没刷新成功：${esc(S.srvLast.error)}。下面是上一次读到的列表（${fmtDay(S.srv.at)} ${fmtTime(S.srv.at)}）。</div>${srvIsSlowError(S.srvLast.error) ? SRV_SLOW_HELP : ''}`;
+    else head += `<div class="ca-note">列表读取于 ${fmtDay(S.srv.at)} ${fmtTime(S.srv.at)}${S.srv.cached ? '（上次记住的）' : ''}。要看最新的点「刷新」。</div>`;
     const ownerOf = backupOwners();
     const groups = new Map();
     for (const r of rows) { if (!groups.has(r.key)) groups.set(r.key, []); groups.get(r.key).push(r); }
@@ -1235,7 +1266,7 @@ async function onPanelClick(e) {
         if (act === 'srv-restore') {
             const pop = P.popup;
             const name = await serverRestore(file);
-            if (name) { S.srv = null; if (P.popup === pop) await closePanel(); toast('success', `已恢复成新聊天「${name}」。`); }
+            if (name) { if (P.popup === pop) await closePanel(); toast('success', `已恢复成新聊天「${name}」。`); }
         }
         return;
     }

@@ -51,7 +51,9 @@ SillyTavern 第三方扩展，防丢楼。v1.0–1.2.0 在 claude.ai 里写完�
 
 **服务器备份**（v1.2.0，「服务器」页）：`/api/backups/chat/get` 列出、`/api/backups/chat/download` 下载，再走 `importToCharacter()`。文件名 `chat_<key>_<YYYYMMDD-HHMMSS>.jsonl`，`backupKeyOf()` 复刻了服务器的 `getBackupKey`（非 ASCII 名字带 sha256 前 8 位），用来把备份对回角色卡。SHA-256 是纯 JS 实现，因为云酒馆常用 http，浏览器不给 `crypto.subtle`。文件名里的时间是服务器本地时间，只用来排序和原样显示。
 
-`/api/backups/chat/get` 在**服务器端**把 backups 目录里每一份文件都用 readline 串行读一遍（`src/endpoints/backups.js` → `getChatInfo`），本机实测约 100MB/s：200 份 182MB 要 1.9 秒，几 GB 就是几十秒到几分钟，直接走 http://ip:端口 又没有反代超时。1.2.0 的面板 `await` 死等这个接口，期间 `P.busy` 为 true，点别的页签都排队，用户越点「刷新」越叠加扫描——这就是 1.2.0「服务器页一直卡死」的原因。1.2.1 改成：`serverBackups()` 是后台任务，`S.srvJob` 保证同一时刻只有一个请求（刷新、切页都不会再发），`S.srvTimeoutMs`（默认 90 秒）用 AbortController 超时，读到缓存 10 分钟（`S.srv`），失败记在 `S.srvLast` 并保留上一次的列表，面板从不 await 它：没结果时返回「正在读取…已等 N 秒」占位（`tickServerWait` 每秒只改那个 span），读完 `finally` 里 `refreshPanel()` 自动显示。
+`/api/backups/chat/get` 在**服务器端**把 backups 目录里每一份文件都用 readline 串行读一遍（`src/endpoints/backups.js` → `getChatInfo`），本机实测约 100MB/s：200 份 182MB 要 1.9 秒，几 GB 就是几十秒到几分钟，直接走 http://ip:端口 又没有反代超时。1.2.0 的面板 `await` 死等这个接口，期间 `P.busy` 为 true，点别的页签都排队，用户越点「刷新」越叠加扫描——这就是 1.2.0「服务器页一直卡死」的原因。1.2.1 改成：`serverBackups()` 是后台任务，`S.srvJob` 保证同一时刻只有一个请求（刷新、切页都不会再发），`S.srvTimeoutMs` 用 AbortController 超时，失败记在 `S.srvLast` 并保留上一次的列表，面板从不 await 它：没结果时返回「正在读取…已等 N 秒」占位（`tickServerWait` 每秒只改那个 span），读完 `finally` 里 `refreshPanel()` 自动显示。
+
+用户装上 1.2.1 后看到的是 **HTTP 504**：反代（60 秒）等不到酒馆。1.2.2 再改：读到的列表存进 localStorage（`chat_anchor_srv_list`，preview 截到 60 字），打开面板先用它，30 分钟内不自动重读（`SRV_TTL`），刷新页面也不用重读；超时默认 5 分钟；502/504/超时时在面板里直接给三步处理办法（删旧备份、config.yaml 里 `backups.common.numberOfBackups` 调小并设 `backups.chat.maxTotalBackups`、反代 `proxy_read_timeout` 加大），并提醒点「再试一次」前等两分钟（代理放弃了酒馆还在读，叠加扫描会拖慢整个酒馆）。接口本身没有分页、没有按角色过滤，扩展端没法绕过。
 
 **旧插件备份救援**（v1.1.0）：只读打开旧插件的 IndexedDB `ST_ChatBackup`（`backups_meta` / `backups_content`，键 `[chatKey, timestamp]`，内容是整份 jsonl 字符串），在「全部聊天」页顶部列出，可预览、导出、导入成新聊天。库不存在时不会顺手建空库；每次读完就关连接。
 
@@ -89,7 +91,7 @@ ST_DIR=~/st KEEP_ST=1 tests/run.sh t5
 - `t1_rootcause.py`：不装小锚复现根因，两条路径（断网 reload / 502 openCharacterChat），10 项。
 - `t3_anchor.py`：A 自动快照，B 去重和跳过，C 断网读取失败，D 502 读取失败，I 第三方读取失败不误拦（含 21 秒等标记作废），E 保存失败补存，F 掉楼检测和覆盖恢复，G 恢复成新聊天，H 面板，59 项。
 - `t4_legacy.py`：旧插件备份救援，8 项。
-- `t5_server.py`：服务器备份页。前 7 项是 1.2.0 的（中文文件名角色卡 `韩川央.png` 自动复制、跑完删掉），后面是 1.2.1 的慢服务器不卡面板 / 只发一个请求 / 超时提示保留旧列表，18 项。
+- `t5_server.py`：服务器备份页。前 7 项是 1.2.0 的（中文文件名角色卡 `韩川央.png` 自动复制、跑完删掉），然后是 1.2.1 的慢服务器不卡面板 / 只发一个请求，1.2.2 的刷新页面后直接用记住的列表 / 504 给处理办法，最后是超时提示保留旧列表，21 项。
 - `t6_group.py`：群聊根因复现 + 守门（断网、502 两条路径）+ 掉楼 + 两种恢复，33 项，约 3 分钟。用户说群聊优先级低，但代码已经验证过能跑。
 - `t7_compression.py`：酒馆开了 `requestCompression` 时的守门、补存、覆盖恢复，13 项。要另起一个实例：`ST_COMPRESS=1 ST_PORT=8124 ST_DATA=/tmp/st-data2 ST_DIR=~/st tests/run.sh t7`（run.sh 会从 default/config.yaml 生成开了压缩、minPayloadSize 2kb 的配置）。
 - `t8_perf.py`：几千楼的性能基线，只打印数字，阈值很宽。`FLOORS=5000 tests/run.sh t8`。
@@ -98,7 +100,7 @@ ST_DIR=~/st KEEP_ST=1 tests/run.sh t5
 
 ## 没做和没验证的
 
-1. 「服务器」页只用 200 份 / 182MB 的备份目录测过（1.9 秒）。用户真实环境里几 GB 的目录没实测，超时 90 秒够不够、酒馆会不会被扫描拖慢，要看她反馈。接口本身没有分页，这是酒馆的限制。
+1. 「服务器」页在用户真实环境里是 HTTP 504（反代 60 秒等不到酒馆）。要她在服务器上删旧备份 / 改 config.yaml / 加大反代超时之后才能读出第一份列表；读出一次之后 1.2.2 会记在本地。本机只用 200 份 / 182MB 测过（1.9 秒）。
 2. 群聊：守门和两种恢复在 1.19.0 上跑通了（t6）；`openGroupById` 路径只试了 502。用户说群聊没几个人玩，先不花力气。
 3. iOS Safari / App 壳：没实测。重点看导出时的 `navigator.share`、切后台时的快照、IndexedDB 会不会被系统清掉。
 4. 400 的来源（`The request's body.chat is not an array.`）：等用户从面板「记录」页复制日志回来。

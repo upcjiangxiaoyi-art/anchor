@@ -2,7 +2,7 @@
 t5_server.py — 「服务器」页：读酒馆自带的服务器备份（data/<用户>/backups/）。
 
 前 7 项照搬 1.2.0 沙盒里的检查（中文文件名的角色卡、备份对回角色、标出掉楼前、一键恢复）。
-后面是 1.2.1 修卡死加的：服务器很慢时面板不卡、只发一个请求、超时有提示并保留上次结果。
+后面是 1.2.1 修卡死加的：服务器很慢时面板不卡、只发一个请求、超时有提示并保留上次结果；1.2.2 加的：列表记在 localStorage、504 给处理办法。
 需要酒馆 1.17 或更新（有 /api/backups/chat/get）。
 """
 import sys
@@ -72,7 +72,7 @@ def main():
 
             # ───────── 1.2.1：服务器慢的时候 ─────────
             C.section('服务器很慢时')
-            pg.evaluate('() => { ChatAnchor.state.srv = null; ChatAnchor.state.srvLast = null; }')
+            pg.evaluate('() => { ChatAnchor.state.srv = null; ChatAnchor.state.srvLast = null; localStorage.removeItem("chat_anchor_srv_list"); }')
             L.slow_fetch(pg, '/api/backups/chat/get', 6000)
             pg.evaluate('() => ChatAnchor.open("cur")')
             pg.wait_for_selector('.ca-panel .ca-tab')
@@ -94,24 +94,51 @@ def main():
             pg.wait_for_selector('.ca-panel .ca-snap, .ca-panel .ca-chat', timeout=15000)
             C.ok(L.slow_hits(pg) == 1, 'S11 期间反复切页、点刷新，只发出了 1 个请求', f'hits={L.slow_hits(pg)}')
             C.ok(pg.locator('.ca-panel .ca-snap').count() == 3, 'S12 服务器返回后列表自动出现（3 份）', f'{pg.locator(".ca-panel .ca-snap").count()}')
+            L.unslow_fetch(pg, '/api/backups/chat/get')
+            pg.keyboard.press('Escape')
+
+            # ───────── 1.2.2：刷新页面后用记住的列表；504 给处理办法 ─────────
+            C.section('刷新页面后用记住的列表')
+            pg2 = c.new_page()
+            con2 = L.Console(pg2)
+            L.goto_app(pg2, ext=True)
+            L.ev(pg2, 'await ctx.selectCharacterById(arg);', idx)
+            L.wait_js(pg2, 'String(ctx.characterId) === String(arg) && ctx.chat.length >= 1', arg=idx)
+            spy2 = L.Spy(pg2, '**/api/backups/chat/get')
+            t0 = time.time()
+            pg2.evaluate('() => ChatAnchor.open("srv")')
+            pg2.wait_for_selector('.ca-panel .ca-snap', timeout=5000)
+            dt = time.time() - t0
+            time.sleep(0.8)
+            C.ok(dt < 1.5 and len(spy2.calls) == 0 and pg2.locator('.ca-panel .ca-snap').count() == 3, 'S13 新页面打开「服务器」立刻显示上次记住的列表，没有发请求', f'{dt:.1f}s calls={len(spy2.calls)}')
+            C.ok('上次记住的' in panel_text(pg2), 'S14 注明这是上次读取的列表和时间', panel_text(pg2)[:120])
+            spy2.remove()
+            f = L.Fault(pg2, '**/api/backups/chat/get', mode=504, body='<html><body>504 Gateway Time-out</body></html>')
+            pg2.click('.ca-panel [data-act="srv-refresh"]')
+            pg2.wait_for_function('() => (document.querySelector(".ca-panel .ca-body")?.innerText || "").includes("刚才没刷新成功")', timeout=8000)
+            txt = panel_text(pg2)
+            C.ok('HTTP 504' in txt and 'proxy_read_timeout' in txt and 'numberOfBackups' in txt and pg2.locator('.ca-panel .ca-snap').count() == 3, 'S15 504 时写明是反代放弃了、给出三步处理办法，并保留列表', txt[:200])
+            pg2.screenshot(path=str(OUT / 't5_server_504.png'))
+            f.remove()
+            pg = pg2
 
             C.section('服务器超时')
             pg.evaluate('() => { ChatAnchor.state.srvTimeoutMs = 2000; }')
             L.slow_fetch(pg, '/api/backups/chat/get', 5000)
             pg.click('.ca-panel [data-act="srv-refresh"]')
             pg.wait_for_function('() => (document.querySelector(".ca-panel .ca-body")?.innerText || "").includes("正在重新读取")', timeout=3000)
-            C.ok(pg.locator('.ca-panel .ca-snap').count() == 3, 'S13 刷新期间旧列表还在，只多一行「正在重新读取…」')
+            C.ok(pg.locator('.ca-panel .ca-snap').count() == 3, 'S16 刷新期间旧列表还在，只多一行「正在重新读取…」')
             pg.wait_for_function('() => (document.querySelector(".ca-panel .ca-body")?.innerText || "").includes("刚才没刷新成功")', timeout=8000)
             txt = panel_text(pg)
-            C.ok('还没把备份列表给出来' in txt and pg.locator('.ca-panel .ca-snap').count() == 3, 'S14 超时后提示原因，并保留上一次读到的列表', txt[:160])
+            C.ok('还没把备份列表给出来' in txt and pg.locator('.ca-panel .ca-snap').count() == 3, 'S17 超时后提示原因，并保留上一次读到的列表', txt[:160])
             err = pg.evaluate('async () => { try { await ChatAnchor.server.list(true); return "ok"; } catch (e) { return e.message; } }')
-            C.ok('秒' in err, 'S15 ChatAnchor.server.list(true) 超时时抛出带原因的错误', err)
-            C.ok(any(r['type'] == '服务器备份' for r in L.ca_log(pg)), 'S16 超时记进了「记录」')
+            C.ok('秒' in err, 'S18 ChatAnchor.server.list(true) 超时时抛出带原因的错误', err)
+            C.ok(any(r['type'] == '服务器备份' for r in L.ca_log(pg)), 'S19 超时记进了「记录」')
             L.unslow_fetch(pg, '/api/backups/chat/get')
-            pg.evaluate('() => { ChatAnchor.state.srvTimeoutMs = 90000; }')
+            pg.evaluate('() => { ChatAnchor.state.srvTimeoutMs = 300000; }')
             pg.screenshot(path=str(OUT / 't5_server_timeout.png'))
 
-            warns = [t for ty, t in con.lines if ty == 'warning' and '[小锚]' in t]
+            warns = [t for ty, t in con.lines + con2.lines if ty == 'warning' and '[小锚]' in t]
             C.ok(not warns, '小锚全程没有输出过警告', str(warns[:3]))
             C.ok(not [e for e in con.errors if 'Internal S' not in e], '页面没有未捕获的异常', str(con.errors[:3]))
             b.close()
