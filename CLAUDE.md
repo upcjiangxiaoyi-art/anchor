@@ -47,6 +47,8 @@ SillyTavern 第三方扩展，防丢楼。v1.0–1.2.0 在 claude.ai 里写完�
 
 用户点开后看到的是 `extra.stImageAtelier`：一个图片扩展（Image Atelier）每隔几分钟往最后一楼的 `extra` 里重写自己的数据，小锚就各存一份。v1.2.4 加了 `settings().ignore`（字段路径列表，`mes` / `extra.xxx` / `meta.xxx`）：`doSnapshot` 里 blob 的哈希仍按完整内容算（内容寻址不能变），但判断"有没有变"的签名用 `stripFields()` 去掉忽略字段后的内容算（`sigs[]` / `metaSig`）。所以忽略的字段单独变了不存快照；真存的时候存完整内容；代价是恢复时这个字段可能是上一次存的旧值。弹窗里有「以后忽略「字段」」按钮（最多列 3 个），设置页有逗号分隔的输入框；两处改完都清 `S.last`，让下一次按新规则重算。
 
+用户随后又发来四张弹窗：新增楼 + `lastInContextMessageId`（正常收到回复）；`extra.reasoning`/`reasoning_duration`/`token_count`/`gen_finished`/`swipe_info` + 正文（重新生成或换 swipe）；以及两张来自她自己的扩展**小海螺（ipe）**：`extra.ipe_inject_env / ipe_inject_desc / ipe_inject_layers`、`extra.stImageAtelier`、**正文 `mes` 和 `swipes`** 都变了，元数据里 `ipe_img_layers_v1`、`ipe_ledger_v2`、`ipe_ledger_src_v1` 也变了，而且用户没操作、相隔 13 分钟（切后台回来）又来一次。结论：小海螺在页面重载/切聊天时重新注入，且每次写出的正文不完全一样（否则哈希相同不会存）。这类快照是真实内容变化，不该加进忽略列表；真正该改的是小海螺本身（写前比较、注入文本不带时间戳/随机值、重载时不重写、内容没变不调 saveChat——它每改一次正文酒馆就往服务器存一次并生成一份备份，和服务器备份目录撑爆直接相关）。她另一个扩展叫小红霞（arrebol）。小海螺的仓库不在这个会话里，她会另开会话处理。弹窗提示语 v1.2.4 之后会按情况区分：新增/删除楼、重新生成、别的扩展写的字段（并指出它是否也改了正文）。
+
 **补存**：保存请求失败 → 记录状态码和响应体 → 3 / 8 / 20 秒后调 `ctx.saveChat()`。integrity 错误不重试，酒馆自己会弹窗。
 
 **恢复**
@@ -111,3 +113,4 @@ ST_DIR=~/st KEEP_ST=1 tests/run.sh t5
 5. `requestCompression` 已验证（`tests/t7_compression.py`，13 项）：请求体确实是 gzip（看到 Content-Encoding 和 1f8b 魔数），守门退回"当前聊天"后不误拦、断网仍拦、覆盖恢复能确认保存成功、补存正常。
 6. 性能基线（`tests/t8_perf.py`，3000 楼、角色楼带 2 个 swipe、7.8MB 文件，本机 Chromium 141）：酒馆打开 1.4 秒；小锚首次快照把全部楼层写进 IndexedDB 再花 1.7 秒（期间最长的长任务 360ms，含酒馆自己的渲染）；之后内容没变的重算 127ms、改一楼 114ms（含整理），都没有 >50ms 的长任务；连续 15 份快照平均 132ms/份，13 份快照共 3012 个 blob、约 8.3MB；恢复成新聊天 3.1 秒、覆盖恢复 3.2 秒；面板打开 226ms。手机上没量过，预计慢 3–5 倍。
 7. 上游报告：草稿在 `docs/upstream-bug-report.md`，还没发到 SillyTavern 的 issues。
+8. 小海螺（ipe）每次重载/切后台重写正文且内容不一样，导致小锚不停存快照、酒馆不停往服务器存。要在小海螺的仓库里改成幂等（见上面「改了什么」一段）。可用 `ChatAnchor.diff(newId, oldId)` 验证改完后两次注入是否还有差异。
