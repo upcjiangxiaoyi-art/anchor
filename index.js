@@ -1,0 +1,1002 @@
+/*
+ * 小锚（聊天快照）Chat Anchor — SillyTavern 扩展
+ *
+ * 做三件事：
+ *   1. 守门：酒馆读取聊天失败时，会把开场白当成"新聊天"存回去，盖掉原存档。
+ *            小锚在读取失败后暂停这个聊天的保存，直到重新读取成功。
+ *   2. 快照：直接存内存里的聊天（不是从服务器取回来的），逐楼去重，
+ *            所以能留很多份；打开聊天时发现比上次快照少楼，就锁住掉楼前那份并提醒。
+ *   3. 补存：保存到服务器失败时记下原因并自动重试。
+ *
+ * 零依赖：只用 SillyTavern.getContext()，不 import 酒馆内部文件，酒馆改内部结构也不会让它加载失败。
+ */
+
+const EXT = 'chat_anchor';
+const TAG = '[小锚]';
+const DB_NAME = 'ST_ChatAnchor';
+const DB_VER = 1;
+const HOUR = 3600e3;
+const DAY = 86400e3;
+const DEFAULTS = Object.freeze({
+    enabled: true,    // 自动快照
+    guard: true,      // 读取失败时暂停保存
+    retrySave: true,  // 保存失败自动重试
+    alertDrop: true,  // 掉楼提醒
+    recent: 12,       // 最近 N 份无条件保留
+    days: 7,          // 之后每天留 1 份，留几天
+    maxChats: 30,     // 最多为多少个聊天保留快照
+});
+
+const ctx = () => globalThis.SillyTavern.getContext();
+const warn = (...a) => console.warn(TAG, ...a);
+const tick = () => new Promise(r => setTimeout(r, 0));
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const esc = s => String(s ?? '').replace(/[&<>"']/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', '\'': '&#39;' }[m]));
+const toast = (kind, msg, opts = {}) => { try { globalThis.toastr?.[kind]?.(msg, '小锚', opts); } catch { /* 没有 toastr 也不影响功能 */ } };
+
+const S = {
+    queue: Promise.resolve(),              // 所有写库操作排队执行
+    timer: null,                           // 防抖定时器
+    known: { key: null, set: new Set() },  // 当前聊天已入库的楼层哈希
+    last: new Map(),                       // key -> { sig, ts }
+    poison: new Map(),                     // key -> { at, confirmed, okSeen, released, detail }
+    lastSave: new Map(),                   // key -> { ok, at, detail }
+    retry: { key: null, n: 0, timer: null, toasted: false },
+    popupOpen: false,
+    sinceMaint: 0,
+    blockToastAt: 0,
+    dropToast: null,
+};
+
+function settings() {
+    const all = ctx().extensionSettings;
+    if (!all[EXT] || typeof all[EXT] !== 'object') all[EXT] = {};
+    const s = all[EXT];
+    for (const k of Object.keys(DEFAULTS)) if (s[k] === undefined) s[k] = DEFAULTS[k];
+    return s;
+}
+
+// ───────────────────────── 哈希（cyrb53 + 长度，只在同一个聊天内比较） ─────────────────────────
+function hashOf(str) {
+    let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+    for (let i = 0, ch; i < str.length; i++) {
+        ch = str.charCodeAt(i);
+        h1 = Math.imul(h1 ^ ch, 2654435761);
+        h2 = Math.imul(h2 ^ ch, 1597334677);
+    }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36) + '.' + str.length.toString(36);
+}
+
+// ───────────────────────── IndexedDB ─────────────────────────
+let _db = null;
+function openDB() {
+    if (_db) return Promise.resolve(_db);
+    return new Promise((resolve, reject) => {
+        const rq = indexedDB.open(DB_NAME, DB_VER);
+        rq.onupgradeneeded = () => {
+            const db = rq.result;
+            if (!db.objectStoreNames.contains('snaps')) db.createObjectStore('snaps', { keyPath: 'id' }).createIndex('chatKey', 'chatKey');
+            if (!db.objectStoreNames.contains('blobs')) db.createObjectStore('blobs', { keyPath: ['chatKey', 'hash'] }).createIndex('chatKey', 'chatKey');
+            if (!db.objectStoreNames.contains('chats')) db.createObjectStore('chats', { keyPath: 'chatKey' });
+            if (!db.objectStoreNames.contains('log')) db.createObjectStore('log', { autoIncrement: true });
+        };
+        rq.onsuccess = () => {
+            _db = rq.result;
+            _db.onversionchange = () => { try { _db?.close(); } catch { /* 已关闭 */ } _db = null; };
+            _db.onclose = () => { _db = null; };
+            resolve(_db);
+        };
+        rq.onerror = () => reject(rq.error);
+        rq.onblocked = () => reject(new Error('IndexedDB 被占用'));
+    });
+}
+
+/** 开一个事务，fn 里同步发请求，事务提交后返回 fn 的返回值（通常是个装结果的对象）。 */
+async function tx(stores, mode, fn) {
+    for (let attempt = 0; ; attempt++) {
+        const db = await openDB();
+        try {
+            return await new Promise((resolve, reject) => {
+                const t = db.transaction(stores, mode);
+                let out;
+                t.oncomplete = () => resolve(out);
+                t.onerror = () => reject(t.error);
+                t.onabort = () => reject(t.error || new Error('事务中止'));
+                out = fn(t);
+            });
+        } catch (e) {
+            if (attempt === 0 && e?.name === 'InvalidStateError') { _db = null; continue; }
+            throw e;
+        }
+    }
+}
+const dbGet = (store, key) => tx([store], 'readonly', t => { const o = {}; t.objectStore(store).get(key).onsuccess = e => { o.v = e.target.result; }; return o; }).then(o => o.v);
+const dbPut = (store, val) => tx([store], 'readwrite', t => { t.objectStore(store).put(val); });
+const dbAll = store => tx([store], 'readonly', t => { const o = { v: [] }; t.objectStore(store).getAll().onsuccess = e => { o.v = e.target.result; }; return o; }).then(o => o.v);
+const snapsOf = key => tx(['snaps'], 'readonly', t => { const o = { v: [] }; t.objectStore('snaps').index('chatKey').getAll(key).onsuccess = e => { o.v = e.target.result; }; return o; }).then(o => o.v.sort((a, b) => b.ts - a.ts));
+const blobKeysOf = key => tx(['blobs'], 'readonly', t => { const o = { v: [] }; t.objectStore('blobs').index('chatKey').getAllKeys(key).onsuccess = e => { o.v = e.target.result; }; return o; }).then(o => o.v);
+function deleteByChat(store, key) {
+    const rq = store.index('chatKey').openKeyCursor(IDBKeyRange.only(key));
+    rq.onsuccess = () => { const cur = rq.result; if (cur) { store.delete(cur.primaryKey); cur.continue(); } };
+}
+
+function logEvent(type, msg) {
+    console.log(TAG, type, msg);
+    tx(['log'], 'readwrite', t => { t.objectStore('log').add({ ts: Date.now(), type, msg: String(msg).slice(0, 600) }); }).catch(() => { });
+}
+
+function enqueue(fn) {
+    const p = S.queue.then(() => fn());
+    S.queue = p.catch(e => warn(e));
+    return p;
+}
+
+// ───────────────────────── 当前聊天是谁 ─────────────────────────
+function currentChat() {
+    const c = ctx();
+    if (c.groupId) {
+        const g = c.groups?.find(x => x.id == c.groupId);
+        if (!g?.chat_id) return null;
+        return { key: 'g|' + g.chat_id, kind: 'g', groupId: String(g.id), chatName: String(g.chat_id), owner: g.name || '群聊' };
+    }
+    if (c.characterId !== undefined && c.characterId !== null) {
+        const ch = c.characters?.[c.characterId];
+        if (!ch?.chat || !ch?.avatar) return null;
+        return { key: 'c|' + ch.avatar + '|' + ch.chat, kind: 'c', avatar: ch.avatar, chatName: String(ch.chat), owner: ch.name };
+    }
+    return null;
+}
+
+// ───────────────────────── 快照 ─────────────────────────
+function previewOf(msg) {
+    const text = String(msg?.mes ?? '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+    return { name: String(msg?.name ?? ''), text: text.slice(0, 140) };
+}
+
+async function ensureChatState(key) {
+    if (S.known.key !== key) {
+        const keys = await blobKeysOf(key);
+        S.known = { key, set: new Set(keys.map(k => k[1])) };
+    }
+    if (!S.last.has(key)) {
+        const latest = (await snapsOf(key))[0];
+        S.last.set(key, latest ? { sig: latest.sig, ts: latest.ts } : { sig: null, ts: 0 });
+    }
+}
+
+/**
+ * 给当前聊天存一份快照。内容没变时跳过（除非 force）。
+ * @returns {Promise<object|null>} 新快照记录；跳过或无聊天时为 null
+ */
+function takeSnapshot(reason = 'auto', opts = {}) {
+    return enqueue(() => doSnapshot(reason, opts));
+}
+
+async function doSnapshot(reason, { force = false, lock = false } = {}) {
+    const info = currentChat();
+    if (!info) return null;
+    const c = ctx();
+    const msgs = c.chat.slice();
+    if (!msgs.length) return null;
+    const p = S.poison.get(info.key);
+    if (p && !p.okSeen && !p.released && (p.confirmed || msgs.length <= 1)) return null; // 没读出来的聊天不存快照
+
+    const metaJson = JSON.stringify(c.chatMetadata ?? {});
+    const hashes = new Array(msgs.length);
+    const jsons = new Array(msgs.length);
+    let total = 0;
+    let t0 = performance.now();
+    for (let i = 0; i < msgs.length; i++) {
+        const j = JSON.stringify(msgs[i]) ?? 'null';
+        jsons[i] = j;
+        hashes[i] = hashOf(j);
+        total += j.length;
+        if (performance.now() - t0 > 10) { // 分片，不卡界面
+            await tick();
+            if (currentChat()?.key !== info.key) return null;
+            t0 = performance.now();
+        }
+    }
+    const metaHash = 'M' + hashOf(metaJson);
+    const sig = hashOf(hashes.join(',') + '|' + metaHash);
+
+    await ensureChatState(info.key);
+    const last = S.last.get(info.key);
+    if (!force && last.sig === sig) return null;
+
+    const known = S.known.set;
+    const fresh = new Map();
+    for (let i = 0; i < hashes.length; i++) if (!known.has(hashes[i])) fresh.set(hashes[i], jsons[i]);
+    if (!known.has(metaHash)) fresh.set(metaHash, metaJson);
+
+    const ts = Math.max(Date.now(), last.ts + 1);
+    const pv = previewOf(msgs[msgs.length - 1]);
+    const snap = {
+        id: info.key + '#' + ts, chatKey: info.key, ts, count: msgs.length, hashes, meta: metaHash, sig,
+        name: pv.name, preview: pv.text, reason, locked: !!lock, lockReason: lock ? reason : '', size: total,
+    };
+    const prev = await dbGet('chats', info.key);
+    await tx(['blobs', 'snaps', 'chats'], 'readwrite', t => {
+        const b = t.objectStore('blobs');
+        for (const [hash, json] of fresh) b.put({ chatKey: info.key, hash, json });
+        t.objectStore('snaps').put(snap);
+        t.objectStore('chats').put({
+            ...(prev || {}), chatKey: info.key, kind: info.kind, avatar: info.avatar || '', groupId: info.groupId || '',
+            owner: info.owner, chatName: info.chatName, lastTs: ts, lastCount: msgs.length,
+        });
+    });
+    for (const h of fresh.keys()) known.add(h);
+    S.last.set(info.key, { sig, ts });
+
+    try { await prune(info.key); } catch (e) { warn('整理旧快照失败', e); }
+    if (++S.sinceMaint >= 25) { S.sinceMaint = 0; maintenance().catch(warn); }
+    refreshPanel();
+    return snap;
+}
+
+/** 决定留哪些：锁定的 + 最近 N 份 + 24 小时内每小时 1 份 + N 天内每天 1 份。 */
+function chooseKeep(snaps, st, now) {
+    const keep = new Set();
+    let autoLocks = 0;
+    for (const s of snaps) {
+        if (!s.locked) continue;
+        if (s.lockReason === 'manual') keep.add(s.id);
+        else if (autoLocks++ < 8) keep.add(s.id); // 自动锁定的最多护住最新 8 份
+    }
+    snaps.slice(0, Math.max(1, st.recent)).forEach(s => keep.add(s.id));
+    const hours = new Set(), days = new Set();
+    for (const s of snaps) {
+        const age = now - s.ts;
+        if (age <= DAY) { const h = Math.floor(s.ts / HOUR); if (!hours.has(h)) { hours.add(h); keep.add(s.id); } }
+        if (age <= st.days * DAY) { const d = new Date(s.ts).toDateString(); if (!days.has(d)) { days.add(d); keep.add(s.id); } }
+    }
+    return keep;
+}
+
+/** 删掉超出保留规则的快照，并回收没有快照再引用的楼层。只能在队列里调用。 */
+async function prune(key, forceGc = false) {
+    const snaps = await snapsOf(key);
+    const keep = chooseKeep(snaps, settings(), Date.now());
+    const drop = snaps.filter(s => !keep.has(s.id));
+    if (!drop.length && !forceGc) return 0;
+    const live = new Set();
+    for (const s of snaps) if (keep.has(s.id)) { live.add(s.meta); for (const h of s.hashes) live.add(h); }
+    const dead = (await blobKeysOf(key)).filter(k => !live.has(k[1]));
+    await tx(['snaps', 'blobs'], 'readwrite', t => {
+        const a = t.objectStore('snaps'), b = t.objectStore('blobs');
+        for (const s of drop) a.delete(s.id);
+        for (const k of dead) b.delete(k);
+    });
+    if (S.known.key === key) for (const k of dead) S.known.set.delete(k[1]);
+    return drop.length;
+}
+
+async function deleteChatData(key) {
+    await tx(['snaps', 'blobs', 'chats'], 'readwrite', t => {
+        deleteByChat(t.objectStore('snaps'), key);
+        deleteByChat(t.objectStore('blobs'), key);
+        t.objectStore('chats').delete(key);
+    });
+    if (S.known.key === key) S.known = { key: null, set: new Set() };
+    S.last.delete(key);
+}
+
+/** 聊天数超过上限时，淘汰最久没动过的（当前聊天、30 天内有锁定快照的除外）；顺便裁剪记录。 */
+function maintenance() {
+    return enqueue(async () => {
+        const st = settings();
+        const chats = (await dbAll('chats')).sort((a, b) => a.lastTs - b.lastTs);
+        const curKey = currentChat()?.key;
+        let extra = chats.length - Math.max(1, st.maxChats);
+        for (const rec of chats) {
+            if (extra <= 0) break;
+            if (rec.chatKey === curKey) continue;
+            const snaps = await snapsOf(rec.chatKey);
+            if (snaps.some(s => s.locked && Date.now() - s.ts < 30 * DAY)) continue;
+            await deleteChatData(rec.chatKey);
+            extra--;
+        }
+        await tx(['log'], 'readwrite', t => {
+            const store = t.objectStore('log');
+            store.count().onsuccess = e => {
+                let over = e.target.result - 300;
+                if (over <= 0) return;
+                store.openKeyCursor().onsuccess = ev => { const cur = ev.target.result; if (cur && over-- > 0) { store.delete(cur.primaryKey); cur.continue(); } };
+            };
+        });
+    });
+}
+
+function schedule(delay = 1200) {
+    if (!settings().enabled) return;
+    clearTimeout(S.timer);
+    S.timer = setTimeout(() => { S.timer = null; takeSnapshot('auto').catch(warn); }, delay);
+}
+
+// ───────────────────────── 打开聊天时：守门结果 + 掉楼检查 ─────────────────────────
+async function onChatChanged() {
+    clearTimeout(S.timer); S.timer = null;
+    const info = currentChat();
+    const count = ctx().chat.length; // 先同步记下楼数，后面都是异步
+    for (const k of [...S.poison.keys()]) if (!info || k !== info.key) S.poison.delete(k);
+    if (!info) return;
+
+    const p = S.poison.get(info.key);
+    if (p && !p.released) {
+        if (p.okSeen) {
+            S.poison.delete(info.key);
+        } else if (Date.now() - p.at < 20000 || p.confirmed) {
+            p.confirmed = true;
+            logEvent('读取失败', `「${info.chatName}」没读出来（${p.detail}），已暂停保存，存档未被覆盖`);
+            showLoadFailed(info, p);
+            return;
+        } else {
+            S.poison.delete(info.key);
+        }
+    }
+    if (!settings().enabled) return;
+
+    const rec = await dbGet('chats', info.key);
+    if (currentChat()?.key !== info.key) return;
+    if (rec && count < rec.lastCount) {
+        const latest = (await snapsOf(info.key))[0];
+        if (latest && latest.count > count) {
+            await enqueue(async () => {
+                const fresh = await dbGet('snaps', latest.id);
+                if (fresh && !fresh.locked) await dbPut('snaps', { ...fresh, locked: true, lockReason: 'drop' });
+                await dbPut('chats', { ...rec, alert: { from: latest.count, to: count, snapId: latest.id, ts: Date.now() } });
+            });
+            logEvent('掉楼', `「${info.chatName}」上次快照 ${latest.count} 楼，这次打开只有 ${count} 楼，已锁定掉楼前的快照`);
+            if (settings().alertDrop) {
+                clearDropToast();
+                S.dropToast = globalThis.toastr?.warning?.(`「${info.chatName}」少了 ${latest.count - count} 楼（${latest.count} → ${count}）。掉楼前的快照已锁定，点这里恢复。`, '小锚',
+                    { timeOut: 0, extendedTimeOut: 0, closeButton: true, onclick: () => openPanel('cur') });
+            }
+        }
+    }
+    if (count > 0) await takeSnapshot('load');
+}
+
+function clearDropToast() {
+    try { if (S.dropToast) globalThis.toastr?.clear?.(S.dropToast); } catch { /* 已经消失 */ }
+    S.dropToast = null;
+}
+
+function showLoadFailed(info, p) {
+    if (S.popupOpen) return;
+    S.popupOpen = true;
+    (async () => {
+        const c = ctx();
+        const html = `<div class="ca-dialog">
+            <h3>这个聊天没有读取成功</h3>
+            <p>读取「${esc(info.chatName)}」时连接失败${p.detail ? `（${esc(p.detail)}）` : ''}。屏幕上现在只是开场白，服务器上的存档没有被改动。</p>
+            <p>为了不让开场白盖掉存档，小锚已暂停保存这个聊天。重新读取成功后会自动恢复正常。</p>
+        </div>`;
+        const res = await c.callGenericPopup(html, c.POPUP_TYPE.TEXT, '', {
+            okButton: '重新读取', cancelButton: '稍后再说',
+            customButtons: [{ text: '解除暂停', result: 2, tooltip: '放行保存：屏幕上的内容会覆盖服务器存档' }],
+        });
+        S.popupOpen = false;
+        if (res === c.POPUP_RESULT.AFFIRMATIVE) {
+            await ctx().reloadCurrentChat();
+        } else if (res === 2) {
+            const sure = await c.Popup.show.confirm('确定解除暂停？', '解除后，屏幕上的内容（很可能只有开场白）会覆盖服务器上的存档。');
+            if (sure === c.POPUP_RESULT.AFFIRMATIVE) { p.released = true; logEvent('守门', `用户手动解除了「${info.chatName}」的保存暂停`); }
+        }
+    })().catch(e => { S.popupOpen = false; warn(e); });
+}
+
+// ───────────────────────── fetch 守门 ─────────────────────────
+function classify(input, init) {
+    const url = typeof input === 'string' ? input : (input instanceof URL ? input.href : null);
+    if (!url) return null;
+    const path = url.split('?')[0];
+    let op, kind;
+    if (path.endsWith('/api/chats/get')) { op = 'load'; kind = 'c'; }
+    else if (path.endsWith('/api/chats/group/get')) { op = 'load'; kind = 'g'; }
+    else if (path.endsWith('/api/chats/save')) { op = 'save'; kind = 'c'; }
+    else if (path.endsWith('/api/chats/group/save')) { op = 'save'; kind = 'g'; }
+    else return null;
+
+    const body = init?.body;
+    if (op === 'load') {
+        if (typeof body !== 'string') return null;
+        const b = JSON.parse(body);
+        const key = kind === 'c' ? (b.avatar_url && b.file_name ? `c|${b.avatar_url}|${b.file_name}` : null) : (b.id ? `g|${b.id}` : null);
+        return key ? { op, kind, key } : null;
+    }
+    let key = null;
+    if (typeof body === 'string') { // 只看开头和结尾，不解析整个几 MB 的请求体
+        if (kind === 'g') {
+            const m = /^\{"id":("(?:[^"\\]|\\.)*")/.exec(body.slice(0, 800));
+            if (m) key = 'g|' + JSON.parse(m[1]);
+        } else {
+            const m1 = /"file_name":("(?:[^"\\]|\\.)*")/.exec(body.slice(0, 3000));
+            const m2 = /"avatar_url":("(?:[^"\\]|\\.)*")(?:,"force":(?:true|false))?\}$/.exec(body.slice(-800));
+            if (m1 && m2) key = `c|${JSON.parse(m2[1])}|${JSON.parse(m1[1])}`;
+        }
+    }
+    const cur = currentChat()?.key || null;
+    return { op, kind, key: key || cur, cur };
+}
+
+function shouldBlock(info) {
+    if (!settings().guard || !info.key) return false;
+    const p = S.poison.get(info.key);
+    if (!p || p.okSeen || p.released) return false;
+    if (p.confirmed) return true;
+    if (Date.now() - p.at > 20000) { S.poison.delete(info.key); return false; }
+    // 还没确认是酒馆自己读取失败：只拦"刚被清空、只剩开场白"的状态，避免误伤正常保存
+    if (info.key !== info.cur) return false;
+    const chat = ctx().chat;
+    return chat.length <= 1 || (info.kind === 'g' && chat.length <= 20 && chat.every(m => !m?.is_user));
+}
+
+function onLoadSettled(info, ok, detail) {
+    const p = S.poison.get(info.key);
+    if (ok) { if (p) p.okSeen = true; return; }
+    const entry = { at: Date.now(), confirmed: false, okSeen: false, released: false, detail: String(detail) };
+    S.poison.set(info.key, entry);
+    // 20 秒内没有等到酒馆的"聊天已切换"，说明不是酒馆自己在读取（比如别的插件），标记作废
+    setTimeout(() => { if (S.poison.get(info.key) === entry && !entry.confirmed) S.poison.delete(info.key); }, 20000);
+}
+
+/** 记录里显示聊天文件名，不显示内部键 */
+const nameOf = key => String(key || '').split('|').pop() || '未知聊天';
+
+function onBlocked(info) {
+    logEvent('守门', `拦下一次保存：「${nameOf(info.key)}」还没读取成功`);
+    if (Date.now() - S.blockToastAt > 8000) {
+        S.blockToastAt = Date.now();
+        toast('warning', '聊天还没读取成功，这次保存已拦下，服务器上的存档没有被覆盖。');
+    }
+}
+
+function onSaveSettled(info, resp, err) {
+    const key = info.key;
+    if (resp?.ok) {
+        S.lastSave.set(key, { ok: true, at: Date.now() });
+        if (S.retry.key === key && S.retry.n > 0) {
+            logEvent('补存', `「${nameOf(key)}」补存成功`);
+            if (S.retry.toasted) toast('success', '刚才没存上的内容已经补存到服务器。');
+        }
+        if (S.retry.key === key) { clearTimeout(S.retry.timer); S.retry = { key: null, n: 0, timer: null, toasted: false }; }
+        return;
+    }
+    const finish = detail => {
+        S.lastSave.set(key, { ok: false, at: Date.now(), detail });
+        if (/"integrity"/.test(detail)) { logEvent('保存失败', `「${nameOf(key)}」完整性校验未通过（酒馆会自己弹窗处理）`); return; }
+        logEvent('保存失败', `「${nameOf(key)}」${detail}`);
+        if (key && key === currentChat()?.key) {
+            takeSnapshot('auto').catch(warn); // 确保没存上的内容至少在本地有一份
+            scheduleRetry(key, detail);
+        }
+    };
+    if (resp) resp.clone().text().then(t => finish(`HTTP ${resp.status} ${t.slice(0, 200)}`), () => finish(`HTTP ${resp.status}`));
+    else finish(`网络错误 ${err?.message || err}`);
+}
+
+function scheduleRetry(key, detail) {
+    if (!settings().retrySave) return;
+    if (S.retry.key !== key) { clearTimeout(S.retry.timer); S.retry = { key, n: 0, timer: null, toasted: false }; }
+    const r = S.retry;
+    if (!r.toasted) { r.toasted = true; toast('warning', `这次没能存到服务器（${detail.slice(0, 80)}）。内容已在本地快照里，稍后自动重试。`, { timeOut: 8000 }); }
+    const delays = [3000, 8000, 20000];
+    if (r.n >= delays.length) { logEvent('补存', `「${nameOf(key)}」重试 ${delays.length} 次仍失败，等下次保存`); return; }
+    clearTimeout(r.timer);
+    r.timer = setTimeout(async () => {
+        if (currentChat()?.key !== key) return;
+        r.n++;
+        try { await ctx().saveChat(); } catch (e) { warn(e); }
+    }, delays[r.n]);
+}
+
+function installFetchGuard() {
+    if (globalThis.__chatAnchorFetch) return;
+    const orig = globalThis.fetch;
+    const wrapped = function (input, init) {
+        let info = null;
+        try { info = classify(input, init); } catch { info = null; }
+        if (!info) return orig.apply(this, arguments);
+        if (info.op === 'save') {
+            let block = false;
+            try { block = shouldBlock(info); } catch { block = false; }
+            if (block) {
+                try { onBlocked(info); } catch { /* 记录失败不影响拦截 */ }
+                return Promise.resolve(new Response('{"error":"chat_anchor_guard"}', { status: 409, statusText: 'Blocked by Chat Anchor', headers: { 'Content-Type': 'application/json' } }));
+            }
+            const p = orig.apply(this, arguments);
+            p.then(r => { try { onSaveSettled(info, r, null); } catch (e) { warn(e); } }, e => { try { onSaveSettled(info, null, e); } catch (e2) { warn(e2); } });
+            return p;
+        }
+        const p = orig.apply(this, arguments);
+        p.then(r => { try { onLoadSettled(info, r.ok, `HTTP ${r.status}`); } catch (e) { warn(e); } },
+            e => { try { if (e?.name !== 'AbortError') onLoadSettled(info, false, e?.message || String(e)); } catch (e2) { warn(e2); } });
+        return p;
+    };
+    globalThis.fetch = wrapped;
+    globalThis.__chatAnchorFetch = true;
+}
+
+// ───────────────────────── 恢复 / 导出 / 预览 ─────────────────────────
+async function loadSnapData(snap) {
+    const want = [...new Set([...snap.hashes, snap.meta])];
+    const map = await tx(['blobs'], 'readonly', t => {
+        const m = new Map();
+        const store = t.objectStore('blobs');
+        for (const h of want) store.get([snap.chatKey, h]).onsuccess = e => { if (e.target.result) m.set(h, e.target.result.json); };
+        return m;
+    });
+    const lines = [];
+    let missing = 0;
+    for (const h of snap.hashes) {
+        const j = map.get(h);
+        if (j === undefined) missing++;
+        else if (j !== 'null') lines.push(j);
+    }
+    return { metaJson: map.get(snap.meta) ?? '{}', lines, missing };
+}
+
+function buildJsonl(data, names) {
+    let meta = {};
+    try { meta = JSON.parse(data.metaJson) || {}; } catch { meta = {}; }
+    const header = JSON.stringify({ chat_metadata: meta, user_name: names.user || 'User', character_name: names.char || 'Character' });
+    return header + '\n' + data.lines.join('\n');
+}
+
+function uploadHeaders() {
+    const h = { ...ctx().getRequestHeaders() };
+    delete h['Content-Type']; // multipart 由浏览器自己带 boundary
+    return h;
+}
+
+async function waitFor(fn, ms = 10000) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < ms) { if (fn()) return true; await sleep(100); }
+    return false;
+}
+
+async function getSnap(id) {
+    const snap = await dbGet('snaps', id);
+    if (!snap) throw new Error('这份快照已经不存在了');
+    return snap;
+}
+
+/** 恢复成一个新聊天（走酒馆官方的导入接口，不覆盖任何现有文件）。 */
+async function restoreAsNew(id) {
+    const snap = await getSnap(id);
+    const rec = await dbGet('chats', snap.chatKey);
+    const data = await loadSnapData(snap);
+    if (data.missing) logEvent('恢复', `快照缺 ${data.missing} 楼数据，其余照常恢复`);
+    await takeSnapshot('auto').catch(warn);
+    const c = ctx();
+
+    if (snap.chatKey.startsWith('g|')) {
+        const group = c.groups?.find(g => String(g.id) === String(rec?.groupId));
+        if (!group || String(c.groupId) !== String(group.id)) throw new Error('请先打开这个群聊，再恢复它的快照');
+        const fd = new FormData();
+        fd.set('avatar', new File([buildJsonl(data, { user: c.name1, char: group.name })], 'chat-anchor.jsonl', { type: 'application/octet-stream' }));
+        fd.set('file_type', 'jsonl');
+        const r = await fetch('/api/chats/group/import', { method: 'POST', body: fd, headers: uploadHeaders(), cache: 'no-cache' });
+        const out = r.ok ? await r.json() : null;
+        if (!out?.res) throw new Error(`导入失败（HTTP ${r.status}）。可以改用「导出」把文件存下来`);
+        if (!Array.isArray(group.chats)) group.chats = [];
+        group.chats.push(out.res);
+        await c.openGroupChat(group.id, out.res);
+        logEvent('恢复', `群聊快照（${snap.count} 楼）已恢复成新聊天「${out.res}」`);
+        return out.res;
+    }
+
+    let idx = c.characters.findIndex(ch => ch.avatar === rec?.avatar);
+    if (idx < 0) {
+        if (c.groupId || c.characterId === undefined || c.characterId === null) throw new Error('找不到原来的角色卡。请先打开要恢复到的角色，或用「导出」把文件存下来');
+        const ok = await c.Popup.show.confirm('找不到原来的角色卡', `这份快照属于「${esc(rec?.owner || '未知角色')}」，但这张卡已经不在了。要恢复到当前打开的角色「${esc(c.name2)}」吗？`);
+        if (ok !== c.POPUP_RESULT.AFFIRMATIVE) return null;
+        idx = Number(c.characterId);
+    }
+    const ch = c.characters[idx];
+    const fd = new FormData();
+    fd.set('file_type', 'jsonl');
+    fd.set('avatar', new File([buildJsonl(data, { user: c.name1, char: ch.name })], 'chat-anchor.jsonl', { type: 'application/octet-stream' }));
+    fd.set('avatar_url', ch.avatar);
+    fd.set('user_name', c.name1);
+    fd.set('character_name', ch.name);
+    const r = await fetch('/api/chats/import', { method: 'POST', body: fd, headers: uploadHeaders(), cache: 'no-cache' });
+    const out = r.ok ? await r.json() : null;
+    const fileName = out?.fileNames?.[0];
+    if (!fileName) throw new Error(`导入失败（HTTP ${r.status}）。可以改用「导出」把文件存下来`);
+    const chatName = fileName.replace(/\.jsonl$/i, '');
+    if (c.groupId || String(c.characterId) !== String(idx)) {
+        await c.selectCharacterById(idx);
+        if (!await waitFor(() => !ctx().groupId && String(ctx().characterId) === String(idx))) throw new Error(`已导入为「${chatName}」，但没能自动切到角色。请手动打开这个角色的聊天列表`);
+    }
+    await ctx().openCharacterChat(chatName);
+    logEvent('恢复', `快照（${snap.count} 楼）已恢复成新聊天「${chatName}」`);
+    return chatName;
+}
+
+/** 用快照覆盖当前打开的聊天。覆盖前会先把当前状态存成一份锁定快照，可以反悔。 */
+async function restoreInPlace(id) {
+    const snap = await getSnap(id);
+    const info = currentChat();
+    if (!info || info.key !== snap.chatKey) throw new Error('这份快照不属于当前打开的聊天');
+    const p = S.poison.get(info.key);
+    if (p && p.confirmed && !p.okSeen && !p.released) throw new Error('这个聊天还没读取成功，请先点「重新读取」');
+    const data = await loadSnapData(snap);
+    const msgs = [];
+    for (const line of data.lines) { try { const m = JSON.parse(line); if (m && typeof m === 'object') msgs.push(m); } catch { /* 跳过坏行 */ } }
+    if (!msgs.length) throw new Error('这份快照里没有可用的楼层');
+    let meta = {};
+    try { meta = JSON.parse(data.metaJson) || {}; } catch { meta = {}; }
+
+    await takeSnapshot('pre-restore', { force: true, lock: true });
+    const c = ctx();
+    if (currentChat()?.key !== info.key) throw new Error('聊天已经切换，已取消恢复');
+    const integrity = c.chatMetadata?.integrity; // 沿用当前文件的校验码，否则酒馆会拒绝保存
+    c.chat.splice(0, c.chat.length, ...msgs);
+    c.updateChatMetadata({ ...meta, ...(integrity ? { integrity } : {}) }, true);
+
+    const t0 = Date.now();
+    await c.saveChat();
+    const ls = S.lastSave.get(info.key);
+    const saved = !!(ls && ls.ok && ls.at >= t0);
+    if (saved) {
+        await ctx().reloadCurrentChat();
+    } else {
+        const c2 = ctx();
+        if (typeof c2.clearChat === 'function' && typeof c2.printMessages === 'function') { await c2.clearChat(); await c2.printMessages(); }
+        toast('warning', '内容已恢复到页面上，但还没成功存到服务器。先别刷新，等自动补存成功的提示。', { timeOut: 10000 });
+    }
+    const rec = await dbGet('chats', info.key);
+    if (rec?.alert) await enqueue(() => dbPut('chats', { ...rec, alert: null }));
+    logEvent('恢复', `「${info.chatName}」已用 ${snap.count} 楼的快照覆盖${saved ? '' : '（服务器保存未确认）'}`);
+    return saved;
+}
+
+const stamp = ts => { const d = new Date(ts); const z = n => String(n).padStart(2, '0'); return `${d.getFullYear()}${z(d.getMonth() + 1)}${z(d.getDate())}-${z(d.getHours())}${z(d.getMinutes())}`; };
+
+async function exportSnap(id) {
+    const snap = await getSnap(id);
+    const rec = await dbGet('chats', snap.chatKey);
+    const data = await loadSnapData(snap);
+    const jsonl = buildJsonl(data, { user: ctx().name1, char: rec?.owner });
+    const name = `${String(rec?.chatName || 'chat').replace(/[\\/:*?"<>|]/g, '_')} ${stamp(snap.ts)}.jsonl`;
+    const file = new File([jsonl], name, { type: 'application/octet-stream' });
+    if (/iPhone|iPad|iPod|Android/i.test(navigator.userAgent) && navigator.canShare?.({ files: [file] })) {
+        try { await navigator.share({ files: [file], title: name }); return; } catch (e) { if (e?.name === 'AbortError') return; }
+    }
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(file);
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 4000);
+}
+
+async function previewSnap(id) {
+    const snap = await getSnap(id);
+    const data = await loadSnapData(snap);
+    const from = Math.max(0, data.lines.length - 60);
+    const parts = [];
+    for (let i = from; i < data.lines.length; i++) {
+        try { const m = JSON.parse(data.lines[i]); parts.push(`#${i}  ${m.name ?? ''}\n${m.mes ?? ''}`); } catch { /* 跳过坏行 */ }
+    }
+    const ta = document.createElement('textarea');
+    ta.className = 'text_pole ca-preview';
+    ta.readOnly = true;
+    ta.value = (from > 0 ? `（共 ${data.lines.length} 楼，这里显示最后 60 楼）\n\n` : '') + parts.join('\n\n\n');
+    const c = ctx();
+    await c.callGenericPopup(ta, c.POPUP_TYPE.TEXT, '', { wide: true, large: true, allowVerticalScrolling: true, okButton: '关闭' });
+}
+
+// ───────────────────────── 面板 ─────────────────────────
+const P = { popup: null, root: null, tab: 'cur', viewKey: null, busy: false, again: false };
+const REASON = { manual: '手动', drop: '掉楼前', 'pre-restore': '恢复前' };
+const z2 = n => String(n).padStart(2, '0');
+const fmtTime = ts => { const d = new Date(ts); return `${z2(d.getHours())}:${z2(d.getMinutes())}`; };
+function fmtDay(ts) {
+    const d = new Date(ts), now = new Date();
+    const day0 = x => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+    const diff = Math.round((day0(now) - day0(d)) / DAY);
+    return diff === 0 ? '今天' : diff === 1 ? '昨天' : `${d.getMonth() + 1}月${d.getDate()}日`;
+}
+const fmtSize = n => n > 1048576 ? (n / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' KB';
+
+function openPanel(tab) {
+    const c = ctx();
+    clearDropToast();
+    if (P.root) { if (tab) { P.tab = tab; P.viewKey = null; } refreshPanel(); return; }
+    P.tab = tab || 'cur';
+    P.viewKey = null;
+    const root = document.createElement('div');
+    root.className = 'ca-panel';
+    root.addEventListener('click', e => { onPanelClick(e).catch(err => { warn(err); toast('error', String(err?.message || err)); }); });
+    root.addEventListener('change', onPanelChange);
+    P.root = root;
+    P.popup = new c.Popup(root, c.POPUP_TYPE.DISPLAY, '', { wide: true, large: true, allowVerticalScrolling: true, onClose: () => { P.root = null; P.popup = null; } });
+    P.popup.show();
+    refreshPanel();
+}
+
+async function closePanel() {
+    const pop = P.popup;
+    P.root = null; P.popup = null;
+    try { await pop?.complete?.(ctx().POPUP_RESULT.CANCELLED); } catch { /* 已关闭 */ }
+}
+
+function refreshPanel() {
+    if (!P.root) return;
+    if (P.busy) { P.again = true; return; }
+    P.busy = true;
+    render().catch(warn).finally(() => { P.busy = false; if (P.again) { P.again = false; refreshPanel(); } });
+}
+
+async function render() {
+    const root = P.root;
+    if (!root) return;
+    const info = currentChat();
+    let body;
+    if (P.tab === 'cur') body = await renderTimeline(info?.key, info, false);
+    else if (P.tab === 'all') body = P.viewKey ? await renderTimeline(P.viewKey, info, true) : await renderChats(info);
+    else if (P.tab === 'log') body = await renderLog();
+    else body = await renderSettings();
+    if (P.root !== root) return;
+    const tabs = [['cur', '当前聊天'], ['all', '全部聊天'], ['log', '记录'], ['set', '设置']];
+    const scroller = root.closest('.popup-content') || root.parentElement;
+    const top = scroller?.scrollTop ?? 0;
+    root.innerHTML = `
+        <header class="ca-head">
+            <div class="ca-title"><i class="fa-solid fa-anchor"></i><span>小锚</span></div>
+            <div class="menu_button" data-act="snap-now" title="给当前聊天存一份并锁定">立即快照</div>
+        </header>
+        <nav class="ca-tabs" role="tablist">${tabs.map(([id, label]) => `<button type="button" class="ca-tab" role="tab" aria-selected="${P.tab === id}" data-act="tab" data-tab="${id}">${label}</button>`).join('')}</nav>
+        <section class="ca-body">${body}</section>`;
+    if (scroller) scroller.scrollTop = top;
+}
+
+async function renderTimeline(key, info, withBack) {
+    const back = withBack ? '<button type="button" class="ca-back" data-act="back"><i class="fa-solid fa-chevron-left"></i>全部聊天</button>' : '';
+    if (!key) return back + '<div class="ca-empty">先打开一个聊天。<br>打开后小锚会自动开始存快照。</div>';
+    const [rec, snaps] = await Promise.all([dbGet('chats', key), snapsOf(key)]);
+    const isCur = info?.key === key;
+    const owner = rec?.owner || info?.owner || '';
+    const chatName = rec?.chatName || info?.chatName || '';
+    let html = `${back}<div class="ca-chat-name">${esc(owner)}</div><div class="ca-chat-file">${esc(chatName)}${isCur ? '' : '（不是当前打开的聊天）'}</div>`;
+
+    const p = S.poison.get(key);
+    if (isCur && p && p.confirmed && !p.okSeen && !p.released) {
+        html += `<div class="ca-banner">这个聊天还没读取成功，保存已暂停，服务器上的存档没有被改动。
+            <div class="ca-banner-acts"><div class="menu_button" data-act="reload">重新读取</div></div></div>`;
+    } else if (rec?.alert && snaps.some(s => s.id === rec.alert.snapId)) {
+        const a = rec.alert;
+        html += `<div class="ca-banner">${fmtDay(a.ts)} ${fmtTime(a.ts)} 打开时少了 ${a.from - a.to} 楼（${a.from} → ${a.to}）。掉楼前的快照已锁定。
+            <div class="ca-banner-acts"><div class="menu_button" data-act="restore" data-id="${esc(a.snapId)}">恢复那一份</div><div class="menu_button" data-act="ack" data-key="${esc(key)}">不用了</div></div></div>`;
+    }
+    if (!snaps.length) return html + '<div class="ca-empty">这个聊天还没有快照。<br>发一条消息，或点右上角「立即快照」。</div>';
+
+    let day = '';
+    let open = false;
+    snaps.forEach((s, i) => {
+        const d = fmtDay(s.ts);
+        if (d !== day) { if (open) html += '</ol>'; html += `<div class="ca-day">${d}</div><ol class="ca-line">`; open = true; day = d; }
+        const older = snaps[i + 1];
+        const delta = older ? s.count - older.count : 0;
+        const deltaHtml = delta ? `<span class="ca-delta${delta < 0 ? ' is-neg' : ''}">${delta > 0 ? '+' : '−'}${Math.abs(delta)}</span>` : '';
+        const tag = REASON[s.lockReason] || REASON[s.reason] || (s.locked ? '已锁定' : '');
+        html += `<li class="ca-snap${s.locked ? ' is-locked' : ''}${s.lockReason === 'drop' ? ' is-drop' : ''}" data-id="${esc(s.id)}">
+            <div class="ca-snap-head"><time>${fmtTime(s.ts)}</time><span class="ca-floors">${s.count} 楼</span>${deltaHtml}${tag ? `<span class="ca-tag">${tag}</span>` : ''}</div>
+            <div class="ca-prev"><b>${esc(s.name)}</b> ${esc(s.preview) || '（空消息）'}</div>
+            <div class="ca-acts">
+                <div class="menu_button" data-act="restore">恢复</div>
+                <button type="button" class="ca-icon" data-act="preview" title="预览最后 60 楼" aria-label="预览"><i class="fa-solid fa-eye"></i></button>
+                <button type="button" class="ca-icon" data-act="export" title="导出 .jsonl 文件" aria-label="导出"><i class="fa-solid fa-file-export"></i></button>
+                <button type="button" class="ca-icon${s.locked ? ' is-on' : ''}" data-act="lock" title="${s.locked ? '解除锁定' : '锁定：不会被自动清理'}" aria-label="锁定"><i class="fa-solid ${s.locked ? 'fa-lock' : 'fa-lock-open'}"></i></button>
+                <button type="button" class="ca-icon" data-act="del" title="删除这份快照" aria-label="删除"><i class="fa-solid fa-trash-can"></i></button>
+            </div></li>`;
+    });
+    if (open) html += '</ol>';
+    return html;
+}
+
+async function renderChats(info) {
+    const chats = (await dbAll('chats')).sort((a, b) => b.lastTs - a.lastTs);
+    if (!chats.length) return '<div class="ca-empty">还没有任何快照。<br>打开一个聊天聊几句就有了。</div>';
+    return '<ul class="ca-chats">' + chats.map(r => `<li class="ca-chat" data-act="view" data-key="${esc(r.chatKey)}">
+        <div class="ca-chat-main"><div class="ca-chat-name">${esc(r.owner)}${r.chatKey === info?.key ? '（当前）' : ''}</div>
+        <div class="ca-chat-file">${esc(r.chatName)}</div>
+        <div class="ca-chat-meta">${r.lastCount} 楼，最后快照 ${fmtDay(r.lastTs)} ${fmtTime(r.lastTs)}${r.alert ? '，有一次掉楼记录' : ''}</div></div>
+        <button type="button" class="ca-icon" data-act="del-chat" data-key="${esc(r.chatKey)}" title="删除这个聊天的全部快照" aria-label="删除"><i class="fa-solid fa-trash-can"></i></button>
+    </li>`).join('') + '</ul>';
+}
+
+async function renderLog() {
+    const rows = (await dbAll('log')).slice(-150).reverse();
+    const head = '<div class="ca-note">读取失败、保存失败、掉楼、恢复都会记在这里。排查问题时点「复制记录」发给帮你看的人。</div><div class="ca-banner-acts"><div class="menu_button" data-act="copy-log">复制记录</div></div>';
+    if (!rows.length) return head + '<div class="ca-empty">目前一切正常，没有记录。</div>';
+    return head + '<ul class="ca-log">' + rows.map(r => `<li><time>${fmtDay(r.ts)} ${fmtTime(r.ts)}</time><b class="${/失败|掉楼/.test(r.type) ? 'is-bad' : ''}">${esc(r.type)}</b> ${esc(r.msg)}</li>`).join('') + '</ul>';
+}
+
+async function renderSettings() {
+    const st = settings();
+    const [chats, snaps] = await Promise.all([dbAll('chats'), tx(['snaps'], 'readonly', t => { const o = {}; t.objectStore('snaps').count().onsuccess = e => { o.v = e.target.result; }; return o; }).then(o => o.v)]);
+    let usage = '';
+    try { const est = await navigator.storage?.estimate?.(); if (est?.usage) usage = `，本站一共占用 ${fmtSize(est.usage)}`; } catch { /* 不支持就不显示 */ }
+    const toggle = (k, title, desc) => `<label class="ca-row"><span><b>${title}</b><small>${desc}</small></span><input type="checkbox" data-set="${k}" ${st[k] ? 'checked' : ''}></label>`;
+    const num = (k, title, desc, min, max) => `<label class="ca-row"><span><b>${title}</b><small>${desc}</small></span><input type="number" class="text_pole" data-set="${k}" min="${min}" max="${max}" value="${st[k]}"></label>`;
+    return toggle('guard', '读取失败时暂停保存', '聊天没读出来时，不让开场白盖掉服务器上的存档')
+        + toggle('enabled', '自动快照', '发消息、收到回复、编辑、删除之后各存一份，内容没变就跳过')
+        + toggle('alertDrop', '掉楼提醒', '打开聊天时发现比上次快照少楼，弹出提示')
+        + toggle('retrySave', '保存失败自动重试', '没存上服务器时，隔 3 秒、8 秒、20 秒各再试一次')
+        + num('recent', '最近保留几份', '最新的这几份一定留着', 3, 100)
+        + num('days', '按天保留几天', '更早的快照：24 小时内每小时留 1 份，之后每天留 1 份', 1, 60)
+        + num('maxChats', '最多保留几个聊天', '超出后清掉最久没动的聊天（有锁定快照的不清）', 3, 200)
+        + `<div class="ca-note">现在有 ${chats.length} 个聊天、${snaps} 份快照${usage}。<br>快照存在这台设备的浏览器里：换设备、清除网站数据、卸载 App 后就没有了。重要的聊天请用「导出」另存一份。</div>
+        <div class="ca-banner-acts"><div class="menu_button" data-act="wipe">清空全部快照</div></div>`;
+}
+
+function onPanelChange(e) {
+    const el = e.target.closest('[data-set]');
+    if (!el) return;
+    const st = settings();
+    const k = el.dataset.set;
+    if (el.type === 'checkbox') st[k] = el.checked;
+    else {
+        const v = Math.round(Number(el.value));
+        const min = Number(el.min), max = Number(el.max);
+        st[k] = Number.isFinite(v) ? Math.min(max, Math.max(min, v)) : DEFAULTS[k];
+        el.value = st[k];
+    }
+    ctx().saveSettingsDebounced();
+}
+
+async function onPanelClick(e) {
+    const el = e.target.closest('[data-act]');
+    if (!el || !P.root?.contains(el)) return;
+    const act = el.dataset.act;
+    const c = ctx();
+    const id = el.dataset.id || el.closest('[data-id]')?.dataset.id;
+    const yes = async (title, text) => (await c.Popup.show.confirm(title, text)) === c.POPUP_RESULT.AFFIRMATIVE;
+
+    if (act === 'tab') { P.tab = el.dataset.tab; P.viewKey = null; return refreshPanel(); }
+    if (act === 'back') { P.viewKey = null; return refreshPanel(); }
+    if (act === 'view') { P.viewKey = el.dataset.key; return refreshPanel(); }
+    if (act === 'reload') { await closePanel(); return ctx().reloadCurrentChat(); }
+    if (act === 'snap-now') {
+        if (!currentChat()) return toast('info', '先打开一个聊天。');
+        const snap = await takeSnapshot('manual', { force: true, lock: true });
+        toast(snap ? 'success' : 'info', snap ? `已存下 ${snap.count} 楼并锁定。` : '现在没有可以存的内容。');
+        return refreshPanel();
+    }
+    if (act === 'ack') {
+        const rec = await dbGet('chats', el.dataset.key);
+        if (rec) await enqueue(() => dbPut('chats', { ...rec, alert: null }));
+        return refreshPanel();
+    }
+    if (act === 'copy-log') {
+        const rows = (await dbAll('log')).slice(-150);
+        const text = rows.map(r => `${new Date(r.ts).toLocaleString()} [${r.type}] ${r.msg}`).join('\n') || '（没有记录）';
+        try { await navigator.clipboard.writeText(text); toast('success', '记录已复制。'); }
+        catch { await c.callGenericPopup(Object.assign(document.createElement('textarea'), { className: 'text_pole ca-preview', value: text, readOnly: true }), c.POPUP_TYPE.TEXT, '', { wide: true, okButton: '关闭' }); }
+        return;
+    }
+    if (act === 'wipe') {
+        if (!await yes('清空全部快照？', '所有聊天的快照都会删除，包括锁定的。服务器上的聊天不受影响。')) return;
+        await enqueue(async () => {
+            await tx(['snaps', 'blobs', 'chats'], 'readwrite', t => { for (const n of ['snaps', 'blobs', 'chats']) t.objectStore(n).clear(); });
+            S.known = { key: null, set: new Set() }; S.last.clear();
+        });
+        return refreshPanel();
+    }
+    if (act === 'del-chat') {
+        e.stopPropagation();
+        if (!await yes('删除这个聊天的全部快照？', '只删快照，服务器上的聊天不受影响。')) return;
+        await enqueue(() => deleteChatData(el.dataset.key));
+        return refreshPanel();
+    }
+    if (!id) return;
+    if (act === 'preview') return previewSnap(id);
+    if (act === 'export') return exportSnap(id);
+    if (act === 'lock') {
+        await enqueue(async () => { const s = await dbGet('snaps', id); if (s) await dbPut('snaps', { ...s, locked: !s.locked, lockReason: s.locked ? '' : 'manual' }); });
+        return refreshPanel();
+    }
+    if (act === 'del') {
+        const s = await getSnap(id);
+        if (s.locked && !await yes('删除锁定的快照？', '这份快照是锁定的，删除后无法找回。')) return;
+        await enqueue(async () => {
+            await tx(['snaps'], 'readwrite', t => { t.objectStore('snaps').delete(id); });
+            await prune(s.chatKey, true);
+            const latest = (await snapsOf(s.chatKey))[0];
+            S.last.set(s.chatKey, latest ? { sig: latest.sig, ts: latest.ts } : { sig: null, ts: 0 });
+        });
+        return refreshPanel();
+    }
+    if (act === 'restore') {
+        const s = await getSnap(id);
+        const canInPlace = currentChat()?.key === s.chatKey;
+        const html = `<div class="ca-dialog"><h3>恢复 ${fmtDay(s.ts)} ${fmtTime(s.ts)} 的快照（${s.count} 楼）</h3>
+            ${canInPlace ? '<p><b>覆盖当前聊天</b>：聊天文件名不变。覆盖前会把现在的内容另存一份锁定快照，可以反悔。</p>' : ''}
+            <p><b>恢复成新聊天</b>：在这个角色下新建一个聊天，现有的聊天都不动。</p></div>`;
+        const res = await c.callGenericPopup(html, c.POPUP_TYPE.TEXT, '', {
+            okButton: canInPlace ? '覆盖当前聊天' : false, cancelButton: '取消',
+            customButtons: [{ text: '恢复成新聊天', result: 2 }],
+        });
+        if (res !== c.POPUP_RESULT.AFFIRMATIVE && res !== 2) return;
+        await closePanel();
+        if (res === 2) { const name = await restoreAsNew(id); if (name) toast('success', `已恢复成新聊天「${name}」。`); }
+        else { const saved = await restoreInPlace(id); if (saved) toast('success', `已恢复到 ${s.count} 楼。`); }
+    }
+}
+
+// ───────────────────────── 启动 ─────────────────────────
+function addEntryPoints() {
+    const menu = document.getElementById('extensionsMenu');
+    if (menu && !document.getElementById('ca_wand')) {
+        const item = document.createElement('div');
+        item.id = 'ca_wand';
+        item.className = 'list-group-item flex-container flexGap5 interactable';
+        item.tabIndex = 0;
+        item.innerHTML = '<div class="fa-solid fa-anchor extensionsMenuExtensionButton"></div><span>小锚快照</span>';
+        item.addEventListener('click', () => openPanel('cur'));
+        menu.appendChild(item);
+    }
+    const host = document.getElementById('extensions_settings2') || document.getElementById('extensions_settings');
+    if (host && !document.getElementById('ca_drawer')) {
+        const box = document.createElement('div');
+        box.id = 'ca_drawer';
+        box.innerHTML = `<div class="inline-drawer">
+            <div class="inline-drawer-toggle inline-drawer-header"><b>小锚（聊天快照）</b><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div>
+            <div class="inline-drawer-content">
+                <div class="menu_button" id="ca_open"><i class="fa-solid fa-anchor"></i><span>打开小锚</span></div>
+                <small>查看快照、恢复聊天、调整设置。也可以从输入框旁的魔法棒菜单打开。</small>
+            </div></div>`;
+        box.querySelector('#ca_open').addEventListener('click', () => openPanel('cur'));
+        host.appendChild(box);
+    }
+}
+
+let started = false;
+function start() {
+    if (started) return;
+    started = true;
+    const c = ctx();
+    const ev = c.eventTypes || c.event_types || {};
+    const on = (name, fn) => { if (name) c.eventSource.on(name, fn); };
+    settings();
+    addEntryPoints();
+
+    on(ev.CHAT_CHANGED, () => { onChatChanged().catch(warn); });
+    on(ev.MESSAGE_SENT, () => schedule(300));
+    for (const name of [ev.MESSAGE_RECEIVED, ev.GENERATION_ENDED, ev.GENERATION_STOPPED, ev.MESSAGE_EDITED, ev.MESSAGE_UPDATED,
+        ev.MESSAGE_SWIPED, ev.MESSAGE_SWIPE_DELETED, ev.MESSAGE_DELETED, ev.MESSAGE_REASONING_EDITED, ev.MESSAGE_REASONING_DELETED]) {
+        on(name, () => schedule(1200));
+    }
+    // 切到后台前立刻存一份：手机上页面随时可能被系统回收
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden' && settings().enabled) { clearTimeout(S.timer); S.timer = null; takeSnapshot('auto').catch(warn); } });
+    window.addEventListener('pagehide', () => { if (S.timer) { clearTimeout(S.timer); S.timer = null; takeSnapshot('auto').catch(warn); } });
+    window.addEventListener('online', () => { const k = currentChat()?.key; const ls = k && S.lastSave.get(k); if (ls && !ls.ok && settings().retrySave) ctx().saveChat(); });
+
+    try { navigator.storage?.persist?.().catch(() => { }); } catch { /* 不支持就算了 */ }
+    setTimeout(() => maintenance().catch(warn), 20000);
+    if (currentChat()) onChatChanged().catch(warn);
+    console.log(TAG, '已启动');
+}
+
+installFetchGuard(); // 尽早装上，赶在第一次读取聊天之前
+try {
+    const c = ctx();
+    const ready = (c.eventTypes || c.event_types || {}).APP_READY;
+    if (ready) c.eventSource.on(ready, start);
+    setTimeout(start, 5000); // 兜底：老版本没有 APP_READY 的粘性事件
+} catch (e) { warn('启动失败', e); }
+
+// 调试 / 自动化入口
+globalThis.ChatAnchor = {
+    open: openPanel, snapshot: takeSnapshot, restoreInPlace, restoreAsNew, exportSnap,
+    list: async key => snapsOf(key || currentChat()?.key),
+    stats: async () => ({ chats: (await dbAll('chats')).length, snaps: (await dbAll('snaps')).length, blobs: (await blobKeysOf(currentChat()?.key)).length }),
+    log: () => dbAll('log'),
+    state: S,
+};

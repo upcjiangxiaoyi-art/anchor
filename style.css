@@ -1,0 +1,87 @@
+/* 小锚（聊天快照）— 颜色全部取自酒馆主题变量，换主题会跟着变 */
+.ca-panel {
+    --ca-text: var(--SmartThemeBodyColor, #ddd);
+    --ca-muted: color-mix(in srgb, var(--ca-text) 62%, transparent);
+    --ca-faint: color-mix(in srgb, var(--ca-text) 9%, transparent);
+    --ca-line: color-mix(in srgb, var(--ca-text) 28%, transparent);
+    --ca-accent: var(--SmartThemeQuoteColor, #e0a84a);
+    --ca-danger: #d64545;
+    color: var(--ca-text);
+    text-align: left;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 2px 2px 16px;
+    font-variant-numeric: tabular-nums;
+}
+.ca-panel *, .ca-dialog * { box-sizing: border-box; }
+
+.ca-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.ca-title { display: flex; align-items: baseline; gap: 8px; font-size: 1.3em; font-weight: 700; letter-spacing: .04em; }
+.ca-title i { color: var(--ca-accent); font-size: .9em; }
+.ca-panel .menu_button { margin: 0; min-height: 36px; padding: 6px 12px; white-space: nowrap; width: auto; }
+
+.ca-tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--ca-line); }
+.ca-tab {
+    flex: 1; text-align: center; padding: 9px 4px; cursor: pointer; color: var(--ca-muted);
+    border-bottom: 2px solid transparent; margin-bottom: -1px; background: none; border-top: 0; border-left: 0; border-right: 0; font: inherit;
+}
+.ca-tab[aria-selected="true"] { color: var(--ca-text); border-bottom-color: var(--ca-accent); font-weight: 600; }
+.ca-tab:focus-visible, .ca-icon:focus-visible { outline: 2px solid var(--ca-accent); outline-offset: 2px; }
+
+.ca-chat-name { font-size: 1.1em; font-weight: 600; line-height: 1.3; overflow-wrap: anywhere; }
+.ca-chat-file { color: var(--ca-muted); font-size: .85em; overflow-wrap: anywhere; }
+.ca-back { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; color: var(--ca-muted); padding: 6px 0; background: none; border: 0; font: inherit; }
+
+.ca-banner { border-left: 3px solid var(--ca-danger); background: color-mix(in srgb, var(--ca-danger) 12%, transparent); padding: 10px 12px; border-radius: 0 6px 6px 0; line-height: 1.5; }
+.ca-banner-acts { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+
+.ca-empty { color: var(--ca-muted); padding: 28px 8px; text-align: center; line-height: 1.6; }
+
+/* 时间线：左侧一条"锚链"，每份快照一个节点；锁定的节点是实心环 */
+.ca-day { color: var(--ca-muted); font-size: .85em; margin: 14px 0 4px 26px; }
+.ca-line { list-style: none; margin: 0; padding: 0; position: relative; }
+.ca-line::before { content: ""; position: absolute; left: 7px; top: 6px; bottom: 6px; width: 2px; background: var(--ca-line); }
+.ca-snap { position: relative; padding: 8px 0 12px 26px; }
+.ca-snap::before {
+    content: ""; position: absolute; left: 2px; top: 13px; width: 12px; height: 12px; border-radius: 50%;
+    background: var(--SmartThemeBlurTintColor, #222); border: 2px solid var(--ca-line);
+}
+.ca-snap.is-locked::before { border-color: var(--ca-accent); background: var(--ca-accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ca-accent) 25%, transparent); }
+.ca-snap.is-drop::before { border-color: var(--ca-danger); background: var(--ca-danger); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ca-danger) 25%, transparent); }
+.ca-snap-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.ca-snap-head time { font-weight: 600; min-width: 3.2em; }
+.ca-floors { font-size: 1.05em; }
+.ca-delta { font-size: .85em; color: var(--ca-muted); }
+.ca-delta.is-neg { color: var(--ca-danger); font-weight: 600; }
+.ca-tag { margin-left: auto; font-size: .8em; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--ca-line); color: var(--ca-muted); }
+.ca-snap.is-drop .ca-tag { border-color: var(--ca-danger); color: var(--ca-danger); }
+.ca-prev { color: var(--ca-muted); font-size: .9em; line-height: 1.45; margin: 4px 0 8px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+.ca-prev b { color: var(--ca-text); font-weight: 600; }
+.ca-acts { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.ca-icon { width: 38px; height: 36px; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; color: var(--ca-muted); border-radius: 6px; background: none; border: 0; font: inherit; }
+.ca-icon:hover { background: var(--ca-faint); color: var(--ca-text); }
+.ca-icon.is-on { color: var(--ca-accent); }
+
+.ca-chats { list-style: none; margin: 0; padding: 0; }
+.ca-chat { display: flex; align-items: center; gap: 10px; padding: 11px 2px; border-bottom: 1px solid var(--ca-faint); cursor: pointer; }
+.ca-chat-main { flex: 1; min-width: 0; }
+.ca-chat-meta { color: var(--ca-muted); font-size: .85em; }
+
+.ca-log { list-style: none; margin: 0; padding: 0; font-size: .88em; line-height: 1.5; }
+.ca-log li { padding: 6px 0; border-bottom: 1px solid var(--ca-faint); overflow-wrap: anywhere; }
+.ca-log time { color: var(--ca-muted); margin-right: 8px; }
+.ca-log .is-bad { color: var(--ca-danger); }
+
+.ca-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 11px 0; border-bottom: 1px solid var(--ca-faint); cursor: pointer; }
+.ca-row > span { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.ca-row small, .ca-note { color: var(--ca-muted); font-size: .85em; line-height: 1.45; }
+.ca-row input[type="number"] { width: 68px; text-align: center; margin: 0; }
+.ca-row input[type="checkbox"] { flex: none; margin: 0; }
+.ca-note { margin: 12px 0; }
+
+.ca-dialog { text-align: left; line-height: 1.6; }
+.ca-dialog h3 { margin: 0 0 8px; }
+.ca-dialog p { margin: 0 0 8px; }
+.ca-preview { width: 100%; height: 62vh; font-size: .9em; }
+#ca_drawer .menu_button { width: auto; display: inline-flex; gap: 8px; }
