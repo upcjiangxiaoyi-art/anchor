@@ -79,6 +79,7 @@
 .ca-row > span { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .ca-row small, .ca-note { color: var(--ca-muted); font-size: .85em; line-height: 1.45; }
 .ca-row input[type="number"] { width: 68px; text-align: center; margin: 0; }
+.ca-row input[type="text"] { width: 44%; min-width: 120px; margin: 0; font-size: .9em; }
 .ca-row input[type="checkbox"] { flex: none; margin: 0; }
 .ca-note { margin: 12px 0; }
 

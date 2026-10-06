@@ -57,7 +57,20 @@ function settings() {
     if (!all[EXT] || typeof all[EXT] !== 'object') all[EXT] = {};
     const s = all[EXT];
     for (const k of Object.keys(DEFAULTS)) if (s[k] === undefined) s[k] = DEFAULTS[k];
+    if (!Array.isArray(s.ignore)) s.ignore = []; // 判断"有没有变"时跳过的字段，如 extra.stImageAtelier、meta.variables
     return s;
+}
+
+/** 浅拷贝后删掉要忽略的字段。路径支持两级：`mes`、`extra.xxx`；`meta.xxx` 是元数据的键。 */
+function stripFields(obj, paths) {
+    if (!obj || typeof obj !== 'object') return obj;
+    const m = { ...obj };
+    for (const p of paths) {
+        const [a, b] = String(p).split('.');
+        if (b === undefined) delete m[a];
+        else if (m[a] && typeof m[a] === 'object') { if (m[a] === obj[a]) m[a] = { ...m[a] }; delete m[a][b]; }
+    }
+    return m;
 }
 
 // ───────────────────────── 哈希（cyrb53 + 长度，只在同一个聊天内比较） ─────────────────────────
@@ -188,7 +201,11 @@ async function doSnapshot(reason, { force = false, lock = false } = {}) {
     if (p && !p.okSeen && !p.released && (p.confirmed || msgs.length <= 1)) return null; // 没读出来的聊天不存快照
 
     const metaJson = JSON.stringify(c.chatMetadata ?? {});
+    const ignore = settings().ignore.filter(Boolean);
+    const ignoreMsg = ignore.filter(x => !x.startsWith('meta.'));
+    const ignoreMeta = ignore.filter(x => x.startsWith('meta.')).map(x => x.slice(5));
     const hashes = new Array(msgs.length);
+    const sigs = new Array(msgs.length); // 判断"有没有变"用：跳过忽略字段。blob 的哈希仍按完整内容算
     const jsons = new Array(msgs.length);
     let total = 0;
     let t0 = performance.now();
@@ -196,6 +213,7 @@ async function doSnapshot(reason, { force = false, lock = false } = {}) {
         const j = JSON.stringify(msgs[i]) ?? 'null';
         jsons[i] = j;
         hashes[i] = hashOf(j);
+        sigs[i] = ignoreMsg.length ? hashOf(JSON.stringify(stripFields(msgs[i], ignoreMsg)) ?? 'null') : hashes[i];
         total += j.length;
         if (performance.now() - t0 > 10) { // 分片，不卡界面
             await tick();
@@ -204,7 +222,8 @@ async function doSnapshot(reason, { force = false, lock = false } = {}) {
         }
     }
     const metaHash = 'M' + hashOf(metaJson);
-    const sig = hashOf(hashes.join(',') + '|' + metaHash);
+    const metaSig = ignoreMeta.length ? 'M' + hashOf(JSON.stringify(stripFields(c.chatMetadata ?? {}, ignoreMeta))) : metaHash;
+    const sig = hashOf(sigs.join(',') + '|' + metaSig);
 
     await ensureChatState(info.key);
     const last = S.last.get(info.key);
@@ -857,9 +876,24 @@ async function showWhy(newId, oldId) {
         ? '这些都是酒馆自己的记账字段（计数、时间戳、标记），不是你改的。'
         : '正文、swipe、变量这类变化通常来自你的操作或正在跑的脚本（状态栏、变量脚本等）。';
     const c = ctx();
+    const st = settings();
+    const fields = [...new Set([...d.floors.flatMap(f => f.fields), ...d.metaKeys.map(k => 'meta.' + k)])].filter(k => !k.startsWith('（') && !st.ignore.includes(k)).slice(0, 3);
     const html = `<div class="ca-dialog"><h3>${fmtDay(a.ts)} ${fmtTime(a.ts)} 这份比 ${fmtDay(b.ts)} ${fmtTime(b.ts)} 那份</h3>
-        <p>${lines.map(esc).join('<br>')}</p><p class="ca-note">${note}</p></div>`;
-    await c.callGenericPopup(html, c.POPUP_TYPE.TEXT, '', { okButton: '关闭', allowVerticalScrolling: true });
+        <p>${lines.map(esc).join('<br>')}</p><p class="ca-note">${note}</p>
+        ${fields.length ? '<p class="ca-note">点「以后忽略」：这个字段单独变化时不再存快照。真要存的时候仍然存完整内容，只是恢复时这个字段可能是旧值。</p>' : ''}</div>`;
+    const res = await c.callGenericPopup(html, c.POPUP_TYPE.TEXT, '', {
+        okButton: '关闭', cancelButton: false, allowVerticalScrolling: true,
+        customButtons: fields.map((k, i) => ({ text: `以后忽略「${fieldName(k).replace(/（.*/, '')}」`, result: 10 + i })),
+    });
+    const pick = fields[Number(res) - 10];
+    if (pick) {
+        st.ignore = [...new Set([...st.ignore, pick])];
+        c.saveSettingsDebounced();
+        S.last.delete(a.chatKey); // 下一次按新规则重新算
+        logEvent('设置', `以后忽略字段 ${pick} 的变化`);
+        toast('success', `以后「${pick}」单独变了不会再存快照。可以在「设置」里改回来。`);
+        refreshPanel();
+    }
 }
 
 const stamp = ts => { const d = new Date(ts); const z = n => String(n).padStart(2, '0'); return `${d.getFullYear()}${z(d.getMonth() + 1)}${z(d.getDate())}-${z(d.getHours())}${z(d.getMinutes())}`; };
@@ -1274,6 +1308,7 @@ async function renderSettings() {
         + num('recent', '最近保留几份', '最新的这几份一定留着', 3, 100)
         + num('days', '按天保留几天', '更早的快照：24 小时内每小时留 1 份，之后每天留 1 份', 1, 60)
         + num('maxChats', '最多保留几个聊天', '超出后清掉最久没动的聊天（有锁定快照的不清）', 3, 200)
+        + `<label class="ca-row"><span><b>忽略这些字段的变化</b><small>别的扩展往消息里写的记账信息（比如 extra.stImageAtelier）单独变了不存快照。逗号分隔；点快照旁的「改了什么」可以直接加。</small></span><input type="text" class="text_pole" data-set="ignore" value="${esc(st.ignore.join(', '))}" placeholder="无"></label>`
         + `<div class="ca-note">现在有 ${chats.length} 个聊天、${snaps} 份快照${usage}。<br>快照存在这台设备的浏览器里：换设备、清除网站数据、卸载 App 后就没有了。重要的聊天请用「导出」另存一份。</div>
         <div class="ca-banner-acts"><div class="menu_button" data-act="wipe">清空全部快照</div></div>`;
 }
@@ -1284,6 +1319,7 @@ function onPanelChange(e) {
     const st = settings();
     const k = el.dataset.set;
     if (el.type === 'checkbox') st[k] = el.checked;
+    else if (k === 'ignore') { st.ignore = [...new Set(String(el.value).split(/[,，;；\s]+/).map(x => x.trim()).filter(Boolean))]; el.value = st.ignore.join(', '); S.last.clear(); }
     else {
         const v = Math.round(Number(el.value));
         const min = Number(el.min), max = Number(el.max);
