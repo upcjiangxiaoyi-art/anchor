@@ -1308,7 +1308,7 @@ async function renderSettings() {
         + num('recent', '最近保留几份', '最新的这几份一定留着', 3, 100)
         + num('days', '按天保留几天', '更早的快照：24 小时内每小时留 1 份，之后每天留 1 份', 1, 60)
         + num('maxChats', '最多保留几个聊天', '超出后清掉最久没动的聊天（有锁定快照的不清）', 3, 200)
-        + `<label class="ca-row"><span><b>忽略这些字段的变化</b><small>别的扩展往消息里写的记账信息（比如 extra.stImageAtelier）单独变了不存快照。逗号分隔；点快照旁的「改了什么」可以直接加。</small></span><input type="text" class="text_pole" data-set="ignore" value="${esc(st.ignore.join(', '))}" placeholder="无"></label>`
+        + `<label class="ca-row is-stack"><span><b>忽略这些字段的变化</b><small>别的扩展往消息里写的记账信息（比如 extra.stImageAtelier）单独变了不存快照。逗号分隔；点快照旁的「改了什么」可以直接加。</small></span><input type="text" class="text_pole" data-set="ignore" value="${esc(st.ignore.join(', '))}" placeholder="无"></label>`
         + `<div class="ca-note">现在有 ${chats.length} 个聊天、${snaps} 份快照${usage}。<br>快照存在这台设备的浏览器里：换设备、清除网站数据、卸载 App 后就没有了。重要的聊天请用「导出」另存一份。</div>
         <div class="ca-banner-acts"><div class="menu_button" data-act="wipe">清空全部快照</div></div>`;
 }
