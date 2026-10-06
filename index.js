@@ -47,6 +47,9 @@ const S = {
     blockToastAt: 0,
     dropToast: null,
     srv: null,                             // 服务器备份列表的缓存 { at, rows }
+    srvJob: null,                          // 正在进行的服务器列表读取 { promise, startedAt, controller }
+    srvLast: null,                         // 上一次读取的结果 { at, error }
+    srvTimeoutMs: 90000,                   // 服务器列表读取超时
 };
 
 function settings() {
@@ -372,7 +375,7 @@ function showLoadFailed(info, p) {
         const c = ctx();
         const html = `<div class="ca-dialog">
             <h3>这个聊天没有读取成功</h3>
-            <p>读取「${esc(info.chatName)}」时连接失败${p.detail ? `（${esc(p.detail)}）` : ''}。屏幕上现在只是开场白，服务器上的存档没有被改动。</p>
+            <p>读取「${esc(info.chatName)}」时连接失败${p.detail ? `（${esc(p.detail)}）` : ''}。屏幕上现在是空的或只剩开场白，服务器上的存档没有被改动。</p>
             <p>为了不让开场白盖掉存档，小锚已暂停保存这个聊天。重新读取成功后会自动恢复正常。</p>
         </div>`;
         const res = await c.callGenericPopup(html, c.POPUP_TYPE.TEXT, '', {
@@ -440,6 +443,17 @@ function onLoadSettled(info, ok, detail) {
     if (ok) { if (p) p.okSeen = true; return; }
     const entry = { at: Date.now(), confirmed: false, okSeen: false, released: false, detail: String(detail) };
     S.poison.set(info.key, entry);
+    // 群聊读取遇到网络错误时，酒馆会直接抛异常：不保存、不发"聊天已切换"、屏幕留空。
+    // 这时用户再发一句话就会把空聊天存回去盖掉原文件，所以 1 秒后看到当前聊天是空的，就当作读取失败处理。
+    // 别的插件读取失败不会把屏幕清空，不会误伤。
+    setTimeout(() => {
+        if (S.poison.get(info.key) !== entry || entry.confirmed || entry.okSeen || entry.released) return;
+        const cur = currentChat();
+        if (cur?.key !== info.key || ctx().chat.length !== 0) return;
+        entry.confirmed = true;
+        logEvent('读取失败', `「${cur.chatName}」没读出来（${entry.detail}），屏幕是空的，已暂停保存，存档未被覆盖`);
+        showLoadFailed(cur, entry);
+    }, 1000);
     // 20 秒内没有等到酒馆的"聊天已切换"，说明不是酒馆自己在读取（比如别的插件），标记作废
     setTimeout(() => { if (S.poison.get(info.key) === entry && !entry.confirmed) S.poison.delete(info.key); }, 20000);
 }
@@ -844,24 +858,53 @@ function backupOwners() {
     return key => exact.get(key) || loose.get(key) || null;
 }
 
-async function serverBackups(force = false) {
-    if (!force && S.srv && Date.now() - S.srv.at < 120000) return S.srv.rows;
-    const r = await fetch('/api/backups/chat/get', { method: 'POST', headers: ctx().getRequestHeaders() });
-    if (r.status === 404) throw new Error('这个版本的酒馆没有备份接口，需要 1.17 或更新');
-    if (!r.ok) throw new Error(`读取服务器备份失败（HTTP ${r.status}）`);
-    const rows = [];
-    for (const b of await r.json()) {
-        const m = /^chat_(.*)_(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})\.jsonl$/.exec(b?.file_name || '');
-        if (!m) continue;
-        rows.push({
-            file: b.file_name, key: m[1], count: Number(b.chat_items) || 0, size: String(b.file_size || ''),
-            order: Number(m.slice(2).join('')), when: `${Number(m[3])}月${Number(m[4])}日 ${m[5]}:${m[6]}`,
-            preview: String(b.mes || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 140),
-        });
-    }
-    rows.sort((a, b) => b.order - a.order);
-    S.srv = { at: Date.now(), rows };
-    return rows;
+/**
+ * 读取服务器上的备份列表。酒馆这个接口会把 backups 目录里每一份都读一遍，备份多时要等很久，
+ * 所以：同一时刻只发一个请求；有超时；读到就缓存 10 分钟；失败时留着上一次的结果；面板从不 await 它。
+ */
+function serverBackups(force = false) {
+    if (!force && S.srv && Date.now() - S.srv.at < 600000) return Promise.resolve(S.srv.rows);
+    if (S.srvJob) return S.srvJob.promise;
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    const job = { startedAt: Date.now(), controller, promise: null };
+    const timeoutMs = Number(S.srvTimeoutMs) || 90000;
+    const timer = setTimeout(() => { try { controller?.abort(); } catch { /* 忽略 */ } }, timeoutMs);
+    job.promise = (async () => {
+        let error = null;
+        try {
+            const r = await fetch('/api/backups/chat/get', { method: 'POST', headers: ctx().getRequestHeaders(), signal: controller?.signal });
+            if (r.status === 404) throw new Error('这个版本的酒馆没有备份接口，需要 1.17 或更新');
+            if (!r.ok) throw new Error(`读取服务器备份失败（HTTP ${r.status}）`);
+            const list = await r.json().catch(() => null);
+            if (!Array.isArray(list)) throw new Error('服务器返回的不是备份列表');
+            const rows = [];
+            for (const b of list) {
+                const m = /^chat_(.*)_(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})\.jsonl$/.exec(b?.file_name || '');
+                if (!m) continue;
+                rows.push({
+                    file: b.file_name, key: m[1], count: Number(b.chat_items) || 0, size: String(b.file_size || ''),
+                    order: Number(m.slice(2).join('')), when: `${Number(m[3])}月${Number(m[4])}日 ${m[5]}:${m[6]}`,
+                    preview: String(b.mes || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 140),
+                });
+            }
+            rows.sort((a, b) => b.order - a.order);
+            S.srv = { at: Date.now(), rows };
+            return rows;
+        } catch (e) {
+            error = e?.name === 'AbortError'
+                ? `等了 ${Math.round(timeoutMs / 1000)} 秒服务器还没把备份列表给出来。备份文件多的时候酒馆要把每一份都读一遍，会很慢`
+                : String(e?.message || e);
+            logEvent('服务器备份', `读取列表失败：${error}`);
+            throw new Error(error);
+        } finally {
+            clearTimeout(timer);
+            if (S.srvJob === job) S.srvJob = null;
+            S.srvLast = { at: Date.now(), error };
+            if (P.tab === 'srv') refreshPanel(); // 面板开着就自动显示结果
+        }
+    })();
+    S.srvJob = job;
+    return job.promise;
 }
 
 async function serverText(file) {
@@ -894,7 +937,7 @@ async function serverRestore(file, { ask = true } = {}) {
 }
 
 // ───────────────────────── 面板 ─────────────────────────
-const P = { popup: null, root: null, tab: 'cur', viewKey: null, srvKey: undefined, busy: false, again: false };
+const P = { popup: null, root: null, tab: 'cur', viewKey: null, srvKey: undefined, busy: false, again: false, srvTick: null };
 const REASON = { manual: '手动', drop: '掉楼前', 'pre-restore': '恢复前' };
 const z2 = n => String(n).padStart(2, '0');
 const fmtTime = ts => { const d = new Date(ts); return `${z2(d.getHours())}:${z2(d.getMinutes())}`; };
@@ -1031,15 +1074,37 @@ async function renderChats(info) {
     </li>`).join('') + '</ul>';
 }
 
+const SRV_HEAD = `<div class="ca-note">酒馆自己存在服务器上的备份，每个角色留最近 50 份。和在宝塔、1Panel 里翻 backups 文件夹看到的是同一批文件。时间按服务器的时钟。</div>
+        <div class="ca-banner-acts"><div class="menu_button" data-act="srv-refresh">刷新</div></div>`;
+
+/** 「正在读取…已等 N 秒」里的秒数每秒更新一次，不重画整个面板。 */
+function tickServerWait() {
+    clearTimeout(P.srvTick);
+    P.srvTick = setTimeout(() => {
+        const el = P.root?.querySelector('[data-srv-wait]');
+        if (!el || !S.srvJob) return;
+        const secs = Math.round((Date.now() - S.srvJob.startedAt) / 1000);
+        el.textContent = secs >= 2 ? `已等 ${secs} 秒。` : '';
+        tickServerWait();
+    }, 1000);
+}
+
 async function renderServer(info) {
-    let rows;
-    try { rows = await serverBackups(); }
-    catch (e) { return `<div class="ca-empty">${esc(e?.message || e)}</div><div class="ca-banner-acts"><div class="menu_button" data-act="srv-refresh">再试一次</div></div>`; }
+    if (!S.srv && !S.srvJob && !S.srvLast?.error) serverBackups().catch(() => { }); // 第一次打开：后台去读，错误记在 S.srvLast
+    if (!S.srv) {
+        if (S.srvJob) {
+            tickServerWait();
+            return `${SRV_HEAD}<div class="ca-empty">正在读取服务器上的备份… <span data-srv-wait></span><br>酒馆要把服务器上每一份备份都读一遍，备份多就慢。可以先去别的页，读完会自动显示。</div>`;
+        }
+        return `${SRV_HEAD}<div class="ca-empty">${esc(S.srvLast?.error || '还没有读取')}</div><div class="ca-banner-acts"><div class="menu_button" data-act="srv-refresh">再试一次</div></div>`;
+    }
+    const rows = S.srv.rows;
+    let head = SRV_HEAD;
+    if (S.srvJob) { tickServerWait(); head += '<div class="ca-note">正在重新读取… <span data-srv-wait></span></div>'; }
+    else if (S.srvLast?.error && S.srvLast.at > S.srv.at) head += `<div class="ca-note">刚才没刷新成功：${esc(S.srvLast.error)}。下面是上一次读到的列表。</div>`;
     const ownerOf = backupOwners();
     const groups = new Map();
     for (const r of rows) { if (!groups.has(r.key)) groups.set(r.key, []); groups.get(r.key).push(r); }
-    const head = `<div class="ca-note">酒馆自己存在服务器上的备份，每个角色留最近 50 份。和在宝塔、1Panel 里翻 backups 文件夹看到的是同一批文件。时间按服务器的时钟。</div>
-        <div class="ca-banner-acts"><div class="menu_button" data-act="srv-refresh">刷新</div></div>`;
     if (!groups.size) return head + '<div class="ca-empty">服务器上没有聊天备份。<br>可能是酒馆配置里关掉了备份。</div>';
 
     if (P.srvKey === undefined) { // 默认打开当前角色
@@ -1123,11 +1188,7 @@ async function onPanelClick(e) {
     const id = el.dataset.id || el.closest('[data-id]')?.dataset.id;
     const yes = async (title, text) => (await c.Popup.show.confirm(title, text)) === c.POPUP_RESULT.AFFIRMATIVE;
 
-    if (act === 'tab') {
-        P.tab = el.dataset.tab; P.viewKey = null; P.srvKey = undefined;
-        if (P.tab === 'srv' && !S.srv) { const b = P.root.querySelector('.ca-body'); if (b) b.innerHTML = '<div class="ca-empty">正在读取服务器上的备份…</div>'; }
-        return refreshPanel();
-    }
+    if (act === 'tab') { P.tab = el.dataset.tab; P.viewKey = null; P.srvKey = undefined; return refreshPanel(); }
     if (act === 'back') { P.viewKey = null; return refreshPanel(); }
     if (act === 'view') { P.viewKey = el.dataset.key; return refreshPanel(); }
     if (act === 'reload') { await closePanel(); return ctx().reloadCurrentChat(); }
@@ -1163,7 +1224,7 @@ async function onPanelClick(e) {
         await enqueue(() => deleteChatData(el.dataset.key));
         return refreshPanel();
     }
-    if (act === 'srv-refresh') { S.srv = null; return refreshPanel(); }
+    if (act === 'srv-refresh') { serverBackups(true).catch(() => { }); return refreshPanel(); } // 正在读就不再发第二个请求
     if (act === 'srv-back') { P.srvKey = null; return refreshPanel(); }
     if (act === 'srv-view') { P.srvKey = el.dataset.skey; return refreshPanel(); }
     if (act.startsWith('srv-')) {
