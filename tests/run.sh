@@ -12,7 +12,9 @@
 #   ST_DATA     酒馆 dataRoot                                默认 $ST_DIR/data
 #   ST_USER     用户目录名                                   默认 default-user
 #   ST_CONFIG   额外的 config.yaml 路径（可选）
+#   ST_COMPRESS=1  用开了 requestCompression（minPayloadSize 2kb）的配置起酒馆，给 t7 用
 #   KEEP_ST=1   跑完不关酒馆
+# 默认跑 t1 t3 t4 t5 t6。t7（压缩）要单独用 ST_COMPRESS=1 起一个实例；t8（性能）慢，手动跑。
 # 如果端口上已经有酒馆在跑，就直接用它，跑完也不关。
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -22,6 +24,7 @@ REPO="$(cd "$HERE/.." && pwd)"
 : "${ST_DATA:=$ST_DIR/data}"
 : "${ST_USER:=default-user}"
 : "${ST_CONFIG:=}"
+: "${ST_COMPRESS:=0}"
 : "${KEEP_ST:=0}"
 export ST_DIR ST_PORT ST_DATA ST_USER
 OUT="$HERE/out"
@@ -35,6 +38,19 @@ URL="http://127.0.0.1:$ST_PORT/"
 EXT_DIR="$ST_DIR/public/scripts/extensions/third-party"
 mkdir -p "$EXT_DIR"
 [ -e "$EXT_DIR/st-chat-anchor" ] || ln -s "$REPO" "$EXT_DIR/st-chat-anchor"
+
+if [ "$ST_COMPRESS" = 1 ] && [ -z "$ST_CONFIG" ]; then
+    ST_CONFIG="$OUT/config-gzip.yaml"
+    python3 - "$ST_DIR/default/config.yaml" "$ST_CONFIG" <<'PY'
+import re, sys
+src = open(sys.argv[1], encoding='utf-8').read()
+m = re.search(r'(  requestCompression:\n)(.*?)(?=\n  [a-zA-Z]|\n[a-zA-Z])', src, re.S)
+body = m.group(2).replace('    enabled: false', '    enabled: true', 1)
+body = re.sub(r"    minPayloadSize: '[^']*'", "    minPayloadSize: '2kb'", body, count=1)
+open(sys.argv[2], 'w', encoding='utf-8').write(src[:m.start(2)] + body + src[m.end(2):])
+PY
+    echo "已生成开启 requestCompression 的配置：$ST_CONFIG"
+fi
 
 STARTED=0
 if curl -fs "$URL" >/dev/null 2>&1; then

@@ -90,9 +90,11 @@ ST_DIR=~/st KEEP_ST=1 tests/run.sh t5
 - `t3_anchor.py`：A 自动快照，B 去重和跳过，C 断网读取失败，D 502 读取失败，I 第三方读取失败不误拦（含 21 秒等标记作废），E 保存失败补存，F 掉楼检测和覆盖恢复，G 恢复成新聊天，H 面板，59 项。
 - `t4_legacy.py`：旧插件备份救援，8 项。
 - `t5_server.py`：服务器备份页。前 7 项是 1.2.0 的（中文文件名角色卡 `韩川央.png` 自动复制、跑完删掉），后面是 1.2.1 的慢服务器不卡面板 / 只发一个请求 / 超时提示保留旧列表，18 项。
-- `t6_group.py`：群聊根因复现 + 守门（断网、502 两条路径）+ 掉楼 + 两种恢复，约 3 分钟。用户说群聊优先级低，但代码已经验证过能跑。
+- `t6_group.py`：群聊根因复现 + 守门（断网、502 两条路径）+ 掉楼 + 两种恢复，33 项，约 3 分钟。用户说群聊优先级低，但代码已经验证过能跑。
+- `t7_compression.py`：酒馆开了 `requestCompression` 时的守门、补存、覆盖恢复，13 项。要另起一个实例：`ST_COMPRESS=1 ST_PORT=8124 ST_DATA=/tmp/st-data2 ST_DIR=~/st tests/run.sh t7`（run.sh 会从 default/config.yaml 生成开了压缩、minPayloadSize 2kb 的配置）。
+- `t8_perf.py`：几千楼的性能基线，只打印数字，阈值很宽。`FLOORS=5000 tests/run.sh t8`。
 
-注意事项：`/send`、`/sendas`、`/cut` 用来模拟发消息、回复、删楼（走 `ctx.executeSlashCommandsWithOptions`）。角色卡 PNG 里记着「当前聊天名」，酒馆打开角色时按它建聊天，所以导入类检查要按 `ctx.chatId` 核对文件，不能数目录里的文件。toast 会盖住面板顶部的页签，计时的点击要先 `toastr.remove()`。
+注意事项：`/send`、`/sendas`、`/cut` 用来模拟发消息、回复、删楼（走 `ctx.executeSlashCommandsWithOptions`）。角色卡 PNG 里记着「当前聊天名」，酒馆打开角色时按它建聊天，所以导入类检查要按 `ctx.chatId` 核对文件，不能数目录里的文件。toast 会盖住面板顶部的页签，计时的点击要先 `toastr.remove()`。路由回调里不能对 gzip 请求体读 `post_data`（会抛 UnicodeDecodeError，请求就永远不放行）。
 
 ## 没做和没验证的
 
@@ -100,6 +102,6 @@ ST_DIR=~/st KEEP_ST=1 tests/run.sh t5
 2. 群聊：守门和两种恢复在 1.19.0 上跑通了（t6）；`openGroupById` 路径只试了 502。用户说群聊没几个人玩，先不花力气。
 3. iOS Safari / App 壳：没实测。重点看导出时的 `navigator.share`、切后台时的快照、IndexedDB 会不会被系统清掉。
 4. 400 的来源（`The request's body.chat is not an array.`）：等用户从面板「记录」页复制日志回来。
-5. 开了 `requestCompression` 的配置跑过一遍全过，但没确认请求体当时真的被压缩了。压缩后守门拿不到文件名，会退回到"当前聊天"。
-6. 只测过约 300 楼、每楼几百字的聊天。几千楼或带大量 swipe 的没测性能。
+5. `requestCompression` 已验证（`tests/t7_compression.py`，13 项）：请求体确实是 gzip（看到 Content-Encoding 和 1f8b 魔数），守门退回"当前聊天"后不误拦、断网仍拦、覆盖恢复能确认保存成功、补存正常。
+6. 性能基线（`tests/t8_perf.py`，3000 楼、角色楼带 2 个 swipe、7.8MB 文件，本机 Chromium 141）：酒馆打开 1.4 秒；小锚首次快照把全部楼层写进 IndexedDB 再花 1.7 秒（期间最长的长任务 360ms，含酒馆自己的渲染）；之后内容没变的重算 127ms、改一楼 114ms（含整理），都没有 >50ms 的长任务；连续 15 份快照平均 132ms/份，13 份快照共 3012 个 blob、约 8.3MB；恢复成新聊天 3.1 秒、覆盖恢复 3.2 秒；面板打开 226ms。手机上没量过，预计慢 3–5 倍。
 7. 上游报告：草稿在 `docs/upstream-bug-report.md`，还没发到 SillyTavern 的 issues。

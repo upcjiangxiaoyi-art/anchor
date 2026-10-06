@@ -300,7 +300,11 @@ class Fault:
     def _handle(self, route, request):
         if self.times is not None and self.hits >= self.times:
             self.passed += 1
-            self.bodies.append(request.post_data)
+            try:
+                buf = request.post_data_buffer or b''
+                self.bodies.append(None if buf[:2] == b'\x1f\x8b' else buf.decode('utf-8', 'replace'))
+            except Exception:
+                self.bodies.append(None)
             return route.continue_()
         self.hits += 1
         if self.mode == 'abort':
@@ -325,7 +329,14 @@ class Spy:
         page.route(url_glob, self._handle)
 
     def _handle(self, route, request):
-        self.calls.append({'t': time.time(), 'headers': request.headers, 'body': request.post_data, 'len': len(request.post_data_buffer or b'')})
+        try:
+            buf = request.post_data_buffer or b''
+            gz = buf[:2] == b'\x1f\x8b'
+            body = None if gz else buf.decode('utf-8', 'replace')  # gzip 的请求体读 post_data 会抛 UnicodeDecodeError
+            self.calls.append({'t': time.time(), 'headers': request.headers, 'body': body, 'len': len(buf), 'gzip': gz,
+                               'encoding': request.headers.get('content-encoding')})
+        except Exception as e:  # 记录失败也必须放行请求，否则酒馆会一直"保存中"
+            self.calls.append({'t': time.time(), 'error': str(e)})
         route.continue_()
 
     def remove(self):
