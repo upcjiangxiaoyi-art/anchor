@@ -1,7 +1,7 @@
 """
 t8_perf.py — 几千楼的聊天：快照、去重、整理、恢复各要多久，主线程卡不卡。
 
-默认 3000 楼，角色楼带 2 个 swipe，每楼约 700 字。只打印数字，阈值放得很宽（卡主线程 > 200ms 的任务数、首次快照 < 20 秒），
+默认 3000 楼，角色楼带 2 个 swipe，每楼约 700 字。`FLOORS=824 WORDS=1500 EXTRA_KB=40` 模拟用户那个 50MB 的聊天。只打印数字，阈值放得很宽（卡主线程 > 200ms 的任务数、首次快照 < 20 秒），
 目的是留下基线，不是卡 CI。可用 FLOORS=5000 调大。
 """
 import json
@@ -15,7 +15,9 @@ import stlib as L  # noqa: E402
 from playwright.sync_api import sync_playwright  # noqa: E402
 
 FLOORS = int(os.environ.get('FLOORS', '3000'))
-NAME = f'perf-{FLOORS}'
+WORDS = int(os.environ.get('WORDS', '110'))        # 每楼多少个词（约 6 字节一个）
+EXTRA_KB = int(os.environ.get('EXTRA_KB', '0'))    # 角色楼 extra 里塞多少 KB 文本，模拟图片扩展；824 楼 + 40KB ≈ 用户的 50MB 聊天
+NAME = f'perf-{FLOORS}-{WORDS}-{EXTRA_KB}'
 OUT = Path(__file__).parent / 'out'
 LONGTASK_JS = '''() => { window.__lt = []; try { new PerformanceObserver(l => { for (const e of l.getEntries()) window.__lt.push(Math.round(e.duration)); }).observe({ type: 'longtask', buffered: true }); } catch {} }'''
 
@@ -37,7 +39,7 @@ def main():
     L.clear_char_chats()
     OUT.mkdir(exist_ok=True)
     C = L.Checks(f'T8 性能（{FLOORS} 楼）')
-    path = L.write_chat(NAME, FLOORS, swipes=2, words=110)
+    path = L.write_chat(NAME, FLOORS, swipes=2, words=WORDS, extra_kb=EXTRA_KB)
     size_mb = path.stat().st_size / 1048576
     print(f'    聊天文件 {size_mb:.1f} MB', flush=True)
     with sync_playwright() as p:
@@ -67,7 +69,7 @@ def main():
 
         # 改一楼：只写一个新 blob
         long_tasks(pg)
-        r, ms = timed_eval(pg, 'async () => { const ctx = SillyTavern.getContext(); ctx.chat[ctx.chat.length - 1].mes += " 改了一下"; const t0 = performance.now(); const r = await ChatAnchor.snapshot("auto", { force: true }); return [!!r, Math.round(performance.now() - t0)]; }')
+        r, ms = timed_eval(pg, 'async () => { const ctx = SillyTavern.getContext(); ctx.chat[ctx.chat.length - 1].mes += " 改了一下"; const t0 = performance.now(); const r = await ChatAnchor.snapshot("auto"); return [!!r, Math.round(performance.now() - t0)]; }')
         lt = long_tasks(pg)
         st = L.ca_stats(pg)
         print(f'    改 1 楼后快照：{r[1]} ms（含整理旧快照），blob 总数 {st["blobs"]}，长任务 {len(lt)} 个，最长 {max(lt or [0])} ms', flush=True)
@@ -76,7 +78,7 @@ def main():
         # 连续 15 次编辑 → 15 份快照，看库增长和整理耗时
         long_tasks(pg)
         t0 = time.time()
-        pg.evaluate('''async () => { const ctx = SillyTavern.getContext(); for (let i = 0; i < 15; i++) { ctx.chat[ctx.chat.length - 1 - i].mes += " x"; await ChatAnchor.snapshot("auto", { force: true }); } }''')
+        pg.evaluate('''async () => { const ctx = SillyTavern.getContext(); for (let i = 0; i < 15; i++) { ctx.chat[ctx.chat.length - 1 - i].mes += " x"; await ChatAnchor.snapshot("auto"); } }''')
         t_15 = round((time.time() - t0) * 1000)
         lt = long_tasks(pg)
         st = L.ca_stats(pg)
@@ -95,10 +97,11 @@ def main():
         C.ok(isinstance(new_name, str) and L.floors(new_name) == FLOORS, f'P6 恢复成新聊天 {FLOORS} 楼', f'{new_name} floors={L.floors(new_name)}')
         L.wait_snaps(pg, lambda s: any(x['count'] == FLOORS for x in s), timeout=60)
         snap_id = L.snaps(pg)[0]['id']
+        t_read = pg.evaluate('async (id) => { const t0 = performance.now(); await ChatAnchor.loadSnapData(await ChatAnchor.getSnap(id)); return Math.round(performance.now() - t0); }', snap_id)
         t0 = time.time()
         saved = pg.evaluate('async (id) => await ChatAnchor.restoreInPlace(id)', snap_id)
         t_inplace = round((time.time() - t0) * 1000)
-        print(f'    覆盖恢复（含恢复前快照、保存、重新读取）：{t_inplace} ms', flush=True)
+        print(f'    覆盖恢复（含恢复前快照、保存、重新读取）：{t_inplace} ms，其中从库里读出全部楼层 {t_read} ms', flush=True)
         C.ok(saved is True and L.floors(new_name) == FLOORS, 'P7 覆盖恢复成功')
 
         # 面板打开速度

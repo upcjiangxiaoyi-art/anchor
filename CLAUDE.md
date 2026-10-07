@@ -42,6 +42,8 @@ SillyTavern 第三方扩展，防丢楼。v1.0–1.2.0 在 claude.ai 里写完�
 
 **快照**：直接序列化内存里的 `ctx.chat`，不从服务器取。逐楼 `JSON.stringify` + cyrb53，每 10ms 让出一次主线程。签名没变就跳过。
 
+v1.2.5 起是**增量**的（用户的主聊天 48 MiB，每次全量 stringify 在手机上要两三秒）：`S.msgCache` 是 WeakMap，消息对象 → `{ fp, hash, sig, len }`；`fingerprint()` 只看长度和键数（`mes` 长度、swipes 数和总长、`extra` 每个键的长度/键数、`swipe_id`、`send_date`、`gen_finished`）。`auto` / `hidden` 快照只重算：最后 30 楼、`S.dirty` 里酒馆事件（MESSAGE_SENT/RECEIVED/EDITED/UPDATED/SWIPED/SWIPE_DELETED/REASONING_*，取事件第一个参数的楼号）标过的楼、指纹变了的楼、blob 不在库里的楼；其余直接用缓存。全量：`load` / `manual` / `pre-restore`、`force`、`MESSAGE_DELETED`（它传的是新楼数不是楼号，所以置 `S.forceFull`）、距上次全量超过 10 分钟（`S.lastFull`）、或 `snapshot(reason, { full: true })`。快照记录里有 `full` / `reused` 两个字段。已知盲区：老楼被没有事件、长度又恰好相同的改动，最多 10 分钟后才会被全量核对发现（t3 的 J4 把这当性能护栏测着）。
+
 **保留**：锁定的 + 最近 N 份 + 24 小时内每小时 1 份 + N 天内每天 1 份。`prune()` 顺带回收无引用的 blob。
 
 **守门**（`installFetchGuard`，包 `window.fetch`）
@@ -104,7 +106,7 @@ ST_DIR=~/st KEEP_ST=1 tests/run.sh t5
 
 - `stlib.py`：公共库。iPhone 视口 390×844 + 触摸；`Fault` 用 Playwright 路由让某个接口断网 / 返回指定状态码（回调里不能 sleep，会卡住同步 API）；`slow_fetch` 在页面里给 fetch 加延迟模拟慢服务器；磁盘聊天文件读写；`Checks` 计数。
 - `t1_rootcause.py`：不装小锚复现根因，两条路径（断网 reload / 502 openCharacterChat），10 项。
-- `t3_anchor.py`：A 自动快照，B 去重和跳过，C 断网读取失败，D 502 读取失败，I 第三方读取失败不误拦（含 21 秒等标记作废），E 保存失败补存，F 掉楼检测和覆盖恢复，G 恢复成新聊天，H 面板（含「改了什么」标签、弹窗、忽略字段），68 项。
+- `t3_anchor.py`：A 自动快照，B 去重和跳过，C 断网读取失败，D 502 读取失败，I 第三方读取失败不误拦（含 21 秒等标记作废），E 保存失败补存，F 掉楼检测和覆盖恢复，G 恢复成新聊天，H 面板（含「改了什么」标签、弹窗、忽略字段），J 增量重算，75 项。
 - `t4_legacy.py`：旧插件备份救援，8 项。
 - `t5_server.py`：服务器备份页。前 7 项是 1.2.0 的（中文文件名角色卡 `韩川央.png` 自动复制、跑完删掉），然后是 1.2.1 的慢服务器不卡面板 / 只发一个请求，1.2.2 的刷新页面后直接用记住的列表 / 504 给处理办法，最后是超时提示保留旧列表，21 项。
 - `t6_group.py`：群聊根因复现 + 守门（断网、502 两条路径）+ 掉楼 + 两种恢复，33 项，约 3 分钟。用户说群聊优先级低，但代码已经验证过能跑。
@@ -123,4 +125,5 @@ ST_DIR=~/st KEEP_ST=1 tests/run.sh t5
 6. 性能基线（`tests/t8_perf.py`，3000 楼、角色楼带 2 个 swipe、7.8MB 文件，本机 Chromium 141）：酒馆打开 1.4 秒；小锚首次快照把全部楼层写进 IndexedDB 再花 1.7 秒（期间最长的长任务 360ms，含酒馆自己的渲染）；之后内容没变的重算 127ms、改一楼 114ms（含整理），都没有 >50ms 的长任务；连续 15 份快照平均 132ms/份，13 份快照共 3012 个 blob、约 8.3MB；恢复成新聊天 3.1 秒、覆盖恢复 3.2 秒；面板打开 226ms。手机上没量过，预计慢 3–5 倍。
 7. 上游报告：草稿在 `docs/upstream-bug-report.md`，还没发到 SillyTavern 的 issues。
 8. 小海螺（ipe）每次重载/切后台重写正文且内容不一样，导致小锚不停存快照、酒馆不停往服务器存。要在小海螺的仓库里改成幂等（见上面「改了什么」一段）。可用 `ChatAnchor.diff(newId, oldId)` 验证改完后两次注入是否还有差异。用户说 Image Atelier 已在另一个会话里改过。
-9. 50 MB 的聊天：小锚每次快照把整个聊天 stringify + hash 一遍，手机上估计 2–3 秒 CPU。待做：只重算尾部和有事件标记的楼，老楼用缓存（见下一版）。
+9. 50 MB 的聊天：v1.2.5 改成增量重算（见「快照」一段）。
+10. 大聊天基线（`FLOORS=824 WORDS=1500 EXTRA_KB=40 tests/run.sh t8`，43.3 MB，本机 Chromium）：改前没变化重算 458 ms（27.5 MB 时）、每份快照 400 ms；改后没变化重算 14 ms、改一楼 72 ms、连续 15 份平均 29 ms/份。首次打开仍要全量：酒馆打开 2.4 秒 + 小锚首次快照 1.4 秒。`loadSnapData` 改成按 chatKey 整批 `getAll` 再挑，43 MB 读出来 304 ms（原来逐楼 get）。**覆盖恢复在 43 MB 上仍要 35 秒**，不在读库，还没拆开看是哪一步（见 `tests/out` 里 t8 的分段计时）。

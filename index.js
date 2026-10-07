@@ -42,6 +42,10 @@ const S = {
     poison: new Map(),                     // key -> { at, confirmed, okSeen, released, detail }
     lastSave: new Map(),                   // key -> { ok, at, detail }
     retry: { key: null, n: 0, timer: null, toasted: false },
+    msgCache: new WeakMap(),               // 消息对象 -> { fp, hash, sig, len }：大聊天只重算变过的楼
+    dirty: new Set(),                      // 酒馆事件报过的楼号，下次快照必须重算
+    forceFull: false,                      // 删过楼：下次快照全量重算
+    lastFull: new Map(),                   // key -> 上次全量重算的时间
     popupOpen: false,
     sinceMaint: 0,
     blockToastAt: 0,
@@ -59,6 +63,23 @@ function settings() {
     for (const k of Object.keys(DEFAULTS)) if (s[k] === undefined) s[k] = DEFAULTS[k];
     if (!Array.isArray(s.ignore)) s.ignore = []; // 判断"有没有变"时跳过的字段，如 extra.stImageAtelier、meta.variables
     return s;
+}
+
+/**
+ * 一楼的"便宜指纹"：不序列化，只看长度和键数。几十 MB 的聊天每次快照都 stringify 一遍太费手机，
+ * 所以老楼指纹没变就先信上次算好的哈希；指纹变了、酒馆报过事件、最后 30 楼、以及每 10 分钟一次的全量核对，才真正重算。
+ */
+function fingerprint(m) {
+    let fp = `${m.mes?.length ?? -1}|${m.swipe_id ?? ''}|${m.name ?? ''}|${m.send_date ?? ''}|${m.gen_finished ?? ''}|${Object.keys(m).length}`;
+    if (Array.isArray(m.swipes)) { let t = 0; for (const x of m.swipes) t += (x?.length | 0); fp += `|s${m.swipes.length}:${t}`; }
+    const ex = m.extra;
+    if (ex && typeof ex === 'object') {
+        for (const k in ex) {
+            const v = ex[k];
+            fp += `|${k}:${typeof v === 'string' ? v.length : Array.isArray(v) ? 'a' + v.length : v && typeof v === 'object' ? 'o' + Object.keys(v).length : v}`;
+        }
+    }
+    return fp;
 }
 
 /** 浅拷贝后删掉要忽略的字段。路径支持两级：`mes`、`extra.xxx`；`meta.xxx` 是元数据的键。 */
@@ -191,7 +212,7 @@ function takeSnapshot(reason = 'auto', opts = {}) {
     return enqueue(() => doSnapshot(reason, opts));
 }
 
-async function doSnapshot(reason, { force = false, lock = false } = {}) {
+async function doSnapshot(reason, { force = false, lock = false, full: fullOpt = false } = {}) {
     const info = currentChat();
     if (!info) return null;
     const c = ctx();
@@ -204,41 +225,55 @@ async function doSnapshot(reason, { force = false, lock = false } = {}) {
     const ignore = settings().ignore.filter(Boolean);
     const ignoreMsg = ignore.filter(x => !x.startsWith('meta.'));
     const ignoreMeta = ignore.filter(x => x.startsWith('meta.')).map(x => x.slice(5));
+    await ensureChatState(info.key);
+    const known = S.known.set;
+    const dirty = S.dirty;
+    S.dirty = new Set();
+    // 全量：打开聊天、手动、恢复前、删过楼、或者距上次全量超过 10 分钟。其余只重算尾部 30 楼和变过的楼
+    const full = fullOpt || S.forceFull || (reason !== 'auto' && reason !== 'hidden') || Date.now() - (S.lastFull.get(info.key) || 0) > 600000;
+    S.forceFull = false;
+    const tailFrom = Math.max(0, msgs.length - 30);
     const hashes = new Array(msgs.length);
     const sigs = new Array(msgs.length); // 判断"有没有变"用：跳过忽略字段。blob 的哈希仍按完整内容算
-    const jsons = new Array(msgs.length);
-    let total = 0;
+    const fresh = new Map();
+    let total = 0, reused = 0;
     let t0 = performance.now();
     for (let i = 0; i < msgs.length; i++) {
-        const j = JSON.stringify(msgs[i]) ?? 'null';
-        jsons[i] = j;
-        hashes[i] = hashOf(j);
-        sigs[i] = ignoreMsg.length ? hashOf(JSON.stringify(stripFields(msgs[i], ignoreMsg)) ?? 'null') : hashes[i];
+        const m = msgs[i];
+        const isObj = !!m && typeof m === 'object';
+        const fp = isObj ? fingerprint(m) : String(m);
+        const cached = isObj ? S.msgCache.get(m) : undefined;
+        if (!full && cached && cached.fp === fp && i < tailFrom && !dirty.has(i) && known.has(cached.hash)) {
+            hashes[i] = cached.hash; sigs[i] = cached.sig; total += cached.len; reused++;
+            continue;
+        }
+        const j = JSON.stringify(m) ?? 'null';
+        const h = hashOf(j);
+        hashes[i] = h;
+        sigs[i] = ignoreMsg.length ? hashOf(JSON.stringify(stripFields(m, ignoreMsg)) ?? 'null') : h;
         total += j.length;
+        if (!known.has(h)) fresh.set(h, j);
+        if (isObj) S.msgCache.set(m, { fp, hash: h, sig: sigs[i], len: j.length });
         if (performance.now() - t0 > 10) { // 分片，不卡界面
             await tick();
             if (currentChat()?.key !== info.key) return null;
             t0 = performance.now();
         }
     }
+    if (full) S.lastFull.set(info.key, Date.now());
     const metaHash = 'M' + hashOf(metaJson);
     const metaSig = ignoreMeta.length ? 'M' + hashOf(JSON.stringify(stripFields(c.chatMetadata ?? {}, ignoreMeta))) : metaHash;
     const sig = hashOf(sigs.join(',') + '|' + metaSig);
 
-    await ensureChatState(info.key);
     const last = S.last.get(info.key);
     if (!force && last.sig === sig) return null;
-
-    const known = S.known.set;
-    const fresh = new Map();
-    for (let i = 0; i < hashes.length; i++) if (!known.has(hashes[i])) fresh.set(hashes[i], jsons[i]);
     if (!known.has(metaHash)) fresh.set(metaHash, metaJson);
 
     const ts = Math.max(Date.now(), last.ts + 1);
     const pv = previewOf(msgs[msgs.length - 1]);
     const snap = {
         id: info.key + '#' + ts, chatKey: info.key, ts, count: msgs.length, hashes, meta: metaHash, sig,
-        name: pv.name, preview: pv.text, reason, locked: !!lock, lockReason: lock ? reason : '', size: total,
+        name: pv.name, preview: pv.text, reason, locked: !!lock, lockReason: lock ? reason : '', size: total, full, reused,
     };
     const prev = await dbGet('chats', info.key);
     await tx(['blobs', 'snaps', 'chats'], 'readwrite', t => {
@@ -556,11 +591,11 @@ function installFetchGuard() {
 
 // ───────────────────────── 恢复 / 导出 / 预览 ─────────────────────────
 async function loadSnapData(snap) {
-    const want = [...new Set([...snap.hashes, snap.meta])];
+    const want = new Set([...snap.hashes, snap.meta]);
+    // 一次按 chatKey 整批读出来再挑（几十 MB 的聊天逐楼 get 要几十秒，整批读几秒）
     const map = await tx(['blobs'], 'readonly', t => {
         const m = new Map();
-        const store = t.objectStore('blobs');
-        for (const h of want) store.get([snap.chatKey, h]).onsuccess = e => { if (e.target.result) m.set(h, e.target.result.json); };
+        t.objectStore('blobs').index('chatKey').getAll(snap.chatKey).onsuccess = e => { for (const r of e.target.result) if (want.has(r.hash)) m.set(r.hash, r.json); };
         return m;
     });
     const lines = [];
@@ -1482,11 +1517,14 @@ function start() {
     addEntryPoints();
 
     on(ev.CHAT_CHANGED, () => { onChatChanged().catch(warn); });
-    on(ev.MESSAGE_SENT, () => schedule(300));
+    // 事件带的楼号记成"脏"，下次快照一定重算那一楼（MESSAGE_SWIPE_DELETED 传的是对象，MESSAGE_DELETED 传的是新楼数所以单独处理）
+    const mark = id => { const n = Number(id && typeof id === 'object' ? id.messageId : id); if (Number.isInteger(n) && n >= 0) S.dirty.add(n); };
+    on(ev.MESSAGE_SENT, id => { mark(id); schedule(300); });
     for (const name of [ev.MESSAGE_RECEIVED, ev.GENERATION_ENDED, ev.GENERATION_STOPPED, ev.MESSAGE_EDITED, ev.MESSAGE_UPDATED,
-        ev.MESSAGE_SWIPED, ev.MESSAGE_SWIPE_DELETED, ev.MESSAGE_DELETED, ev.MESSAGE_REASONING_EDITED, ev.MESSAGE_REASONING_DELETED]) {
-        on(name, () => schedule(1200));
+        ev.MESSAGE_SWIPED, ev.MESSAGE_SWIPE_DELETED, ev.MESSAGE_REASONING_EDITED, ev.MESSAGE_REASONING_DELETED]) {
+        on(name, id => { mark(id); schedule(1200); });
     }
+    on(ev.MESSAGE_DELETED, () => { S.forceFull = true; schedule(1200); });
     // 切到后台前立刻存一份：手机上页面随时可能被系统回收
     document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden' && settings().enabled) { clearTimeout(S.timer); S.timer = null; takeSnapshot('hidden').catch(warn); } });
     window.addEventListener('pagehide', () => { if (S.timer) { clearTimeout(S.timer); S.timer = null; takeSnapshot('hidden').catch(warn); } });
@@ -1512,7 +1550,7 @@ globalThis.ChatAnchor = {
     list: async key => snapsOf(key || currentChat()?.key),
     stats: async () => ({ chats: (await dbAll('chats')).length, snaps: (await dbAll('snaps')).length, blobs: (await blobKeysOf(currentChat()?.key)).length }),
     log: () => dbAll('log'),
-    diff: diffSnaps,
+    diff: diffSnaps, loadSnapData, getSnap,
     legacy: { list: legacyList, importAsNew: legacyImport, exportFile: legacyExport },
     server: { list: serverBackups, restore: serverRestore, keyOf: backupKeyOf, sha256: sha256Hex },
     state: S,

@@ -117,7 +117,7 @@ def stamp(ts=None):
     return f'{t.tm_year}-{t.tm_mon}-{t.tm_mday} @{t.tm_hour:02d}h {t.tm_min:02d}m {t.tm_sec:02d}s 000ms'
 
 
-def make_msg(i, user_name='User', char_name=CHAR_NAME, text=None, swipes=0, words=60):
+def make_msg(i, user_name='User', char_name=CHAR_NAME, text=None, swipes=0, words=60, extra_kb=0):
     is_user = i % 2 == 1
     body = text if text is not None else (f'第 {i} 楼 ' + ' '.join(f'w{i}_{k}' for k in range(words)))
     m = {
@@ -128,6 +128,8 @@ def make_msg(i, user_name='User', char_name=CHAR_NAME, text=None, swipes=0, word
         'mes': body,
         'extra': {},
     }
+    if extra_kb and not is_user:  # 模拟图片扩展往每一楼塞的大段提示词
+        m['extra']['stImageAtelier'] = {'messageUuid': f'uuid-{i}', 'tags': [{'tagId': f'tag-{i}', 'prompt': (f'Panel {i} composition ' * (extra_kb * 60))[:extra_kb * 1024]}]}
     if not is_user and swipes > 0:
         m['swipe_id'] = 0
         m['swipes'] = [body] + [f'{body} (swipe {k})' for k in range(1, swipes + 1)]
@@ -139,10 +141,10 @@ def chat_header(meta=None, user_name='User', char_name=CHAR_NAME):
     return {'user_name': user_name, 'character_name': char_name, 'create_date': stamp(), 'chat_metadata': meta or {}}
 
 
-def write_chat(name, n, meta=None, swipes=0, words=60, msgs=None):
+def write_chat(name, n, meta=None, swipes=0, words=60, msgs=None, extra_kb=0):
     """往 Seraphina 的聊天目录写一个 n 楼的 .jsonl（第 0 楼是开场白位置，这里统一用生成的内容）。"""
     CHATS_DIR.mkdir(parents=True, exist_ok=True)
-    rows = [chat_header(meta)] + (msgs if msgs is not None else [make_msg(i, swipes=swipes, words=words) for i in range(n)])
+    rows = [chat_header(meta)] + (msgs if msgs is not None else [make_msg(i, swipes=swipes, words=words, extra_kb=extra_kb) for i in range(n)])
     path = CHATS_DIR / f'{name}.jsonl'
     path.write_text('\n'.join(json.dumps(r, ensure_ascii=False) for r in rows) + '\n', 'utf-8')
     return path
@@ -243,7 +245,7 @@ def chat_id(page):
 
 
 def snaps(page, key=None):
-    return page.evaluate('async (k) => (await ChatAnchor.list(k)).map(s => ({id: s.id, ts: s.ts, count: s.count, reason: s.reason, locked: s.locked, lockReason: s.lockReason, sig: s.sig, size: s.size}))', key)
+    return page.evaluate('async (k) => (await ChatAnchor.list(k)).map(s => ({id: s.id, ts: s.ts, count: s.count, reason: s.reason, locked: s.locked, lockReason: s.lockReason, sig: s.sig, size: s.size, full: s.full, reused: s.reused}))', key)
 
 
 def wait_snaps(page, pred, timeout=15.0, key=None):
