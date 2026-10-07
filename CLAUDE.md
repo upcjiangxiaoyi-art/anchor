@@ -19,6 +19,15 @@ SillyTavern 第三方扩展，防丢楼。v1.0–1.2.0 在 claude.ai 里写完�
 **酒馆自带的服务器备份**
 `src/endpoints/chats.js` 的 `backupChat`：按角色卡名分组，每个角色留 50 份，10 秒节流。恢复走 `/api/chats/import`。
 
+**用户的服务器环境**（2026-10-08 在 1Panel 终端里一起查的）
+- VPS，1Panel；酒馆直接 `node server.js` 跑在 `/root/SillyTavern`，端口 8000，`basicAuthMode: true`，单用户 `default-user`。1Panel 里点重启。
+- 访问链：手机 → `huqi.ripple46cc1mm.xyz`（1Panel 的 OpenResty 容器 `1Panel-openresty-xxxx`）→ `/root/huqi-gateway`（她自己的 Node 网关，8121，流式 `req.pipe` 转发，不解析请求体）→ 酒馆 8000。
+- 之前「服务器」页 504 的真正原因：OpenResty 默认 `proxy_read_timeout 60s`，备份目录 1.2 GB 酒馆读不完。已把 `www/sites/huqi.ripple46cc1mm.xyz/proxy/root.conf` 加上 `proxy_read_timeout 300s; proxy_send_timeout 300s;`，之后「服务器」页能读出来了。
+- **主聊天文件 48 MiB**（韩川央，824 楼，备份键 `____6bb1dc23`）：`extra.stImageAtelier` 17.6 MB（图片扩展 Image Atelier 把每张图的生成提示词原样存在楼里，最大一楼 294 KB；用户说在另一个会话里已把它改掉），`mes` 7.9 MB，`swipes` 7.8 MB，`swipe_info` 1.5 MB，`extra.reasoning` 1.2 MB，小海螺的 `ipe_inject_layers/desc` 各 1.2 MB。酒馆每次保存都整份上传，手机上每发一条就传 50 MB——这是她老丢楼的大背景。
+- nginx `client_max_body_size` 原来 50m，离聊天大小只差 1.6 MiB，再聊二十来条保存就会被 413 拒掉。已改成 500m（`conf/nginx.conf`）。
+- `config.yaml` 已改：`performance.requestCompression.enabled: true`（小锚 t7 验证过兼容）、`backups.common.numberOfBackups: 10`、`backups.chat.maxTotalBackups: 80`。改完重启，备份 72 → 71、1.2G → 929M。
+- 那个 400（`body.chat is not an array`）：网关是流式转发，排除；nginx 上限是 413 不是 400；旧插件已停用。不再追。
+
 ## 架构
 
 单文件 `index.js`，不 import 任何酒馆内部模块，只用 `SillyTavern.getContext()`。这是刻意的：旧插件 import 了一堆内部导出，任何一个改名整个插件就加载不了。
@@ -106,11 +115,12 @@ ST_DIR=~/st KEEP_ST=1 tests/run.sh t5
 
 ## 没做和没验证的
 
-1. 「服务器」页在用户真实环境里是 HTTP 504（反代 60 秒等不到酒馆）。要她在服务器上删旧备份 / 改 config.yaml / 加大反代超时之后才能读出第一份列表；读出一次之后 1.2.2 会记在本地。本机只用 200 份 / 182MB 测过（1.9 秒）。
+1. 「服务器」页在用户环境里已经能读出来了（反代超时 300 秒 + 备份裁到 929 MB）。本机只用 200 份 / 182MB 测过（1.9 秒）。
 2. 群聊：守门和两种恢复在 1.19.0 上跑通了（t6）；`openGroupById` 路径只试了 502。用户说群聊没几个人玩，先不花力气。
 3. iOS Safari / App 壳：没实测。重点看导出时的 `navigator.share`、切后台时的快照、IndexedDB 会不会被系统清掉。
-4. 400 的来源（`The request's body.chat is not an array.`）：等用户从面板「记录」页复制日志回来。
+4. 400 的来源：见上面「用户的服务器环境」，不再追。
 5. `requestCompression` 已验证（`tests/t7_compression.py`，13 项）：请求体确实是 gzip（看到 Content-Encoding 和 1f8b 魔数），守门退回"当前聊天"后不误拦、断网仍拦、覆盖恢复能确认保存成功、补存正常。
 6. 性能基线（`tests/t8_perf.py`，3000 楼、角色楼带 2 个 swipe、7.8MB 文件，本机 Chromium 141）：酒馆打开 1.4 秒；小锚首次快照把全部楼层写进 IndexedDB 再花 1.7 秒（期间最长的长任务 360ms，含酒馆自己的渲染）；之后内容没变的重算 127ms、改一楼 114ms（含整理），都没有 >50ms 的长任务；连续 15 份快照平均 132ms/份，13 份快照共 3012 个 blob、约 8.3MB；恢复成新聊天 3.1 秒、覆盖恢复 3.2 秒；面板打开 226ms。手机上没量过，预计慢 3–5 倍。
 7. 上游报告：草稿在 `docs/upstream-bug-report.md`，还没发到 SillyTavern 的 issues。
-8. 小海螺（ipe）每次重载/切后台重写正文且内容不一样，导致小锚不停存快照、酒馆不停往服务器存。要在小海螺的仓库里改成幂等（见上面「改了什么」一段）。可用 `ChatAnchor.diff(newId, oldId)` 验证改完后两次注入是否还有差异。
+8. 小海螺（ipe）每次重载/切后台重写正文且内容不一样，导致小锚不停存快照、酒馆不停往服务器存。要在小海螺的仓库里改成幂等（见上面「改了什么」一段）。可用 `ChatAnchor.diff(newId, oldId)` 验证改完后两次注入是否还有差异。用户说 Image Atelier 已在另一个会话里改过。
+9. 50 MB 的聊天：小锚每次快照把整个聊天 stringify + hash 一遍，手机上估计 2–3 秒 CPU。待做：只重算尾部和有事件标记的楼，老楼用缓存（见下一版）。
