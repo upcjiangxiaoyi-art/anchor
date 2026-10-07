@@ -183,15 +183,15 @@ def launch(p, mobile=True):
 
 
 class Console:
-    """收集控制台输出和页面错误，顺便记下 4xx/5xx 的响应。"""
+    """收集控制台输出和页面错误。
+    注意：不要挂 page.on('request'/'response')——Playwright 会把每个请求的请求体整个传给 Python，
+    几十 MB 的聊天保存一次就让 evaluate 卡 30 秒，测出来的时间全是假的。"""
 
     def __init__(self, page):
         self.lines = []
         self.errors = []
-        self.bad = []
         page.on('console', lambda m: self.lines.append((m.type, m.text)))
         page.on('pageerror', lambda e: self.errors.append(str(e)))
-        page.on('response', lambda r: self.bad.append((r.status, r.url)) if r.status >= 400 else None)
 
     def find(self, needle):
         return [t for _, t in self.lines if needle in t]

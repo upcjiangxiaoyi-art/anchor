@@ -113,7 +113,7 @@ ST_DIR=~/st KEEP_ST=1 tests/run.sh t5
 - `t7_compression.py`：酒馆开了 `requestCompression` 时的守门、补存、覆盖恢复，13 项。要另起一个实例：`ST_COMPRESS=1 ST_PORT=8124 ST_DATA=/tmp/st-data2 ST_DIR=~/st tests/run.sh t7`（run.sh 会从 default/config.yaml 生成开了压缩、minPayloadSize 2kb 的配置）。
 - `t8_perf.py`：几千楼的性能基线，只打印数字，阈值很宽。`FLOORS=5000 tests/run.sh t8`。
 
-注意事项：`/send`、`/sendas`、`/cut` 用来模拟发消息、回复、删楼（走 `ctx.executeSlashCommandsWithOptions`）。角色卡 PNG 里记着「当前聊天名」，酒馆打开角色时按它建聊天，所以导入类检查要按 `ctx.chatId` 核对文件，不能数目录里的文件。toast 会盖住面板顶部的页签，计时的点击要先 `toastr.remove()`。路由回调里不能对 gzip 请求体读 `post_data`（会抛 UnicodeDecodeError，请求就永远不放行）。
+注意事项：`/send`、`/sendas`、`/cut` 用来模拟发消息、回复、删楼（走 `ctx.executeSlashCommandsWithOptions`）。角色卡 PNG 里记着「当前聊天名」，酒馆打开角色时按它建聊天，所以导入类检查要按 `ctx.chatId` 核对文件，不能数目录里的文件。toast 会盖住面板顶部的页签，计时的点击要先 `toastr.remove()`。路由回调里不能对 gzip 请求体读 `post_data`（会抛 UnicodeDecodeError，请求就永远不放行）。**不要挂 `page.on('request'/'response')`**：Playwright 会把每个请求的请求体整个传给 Python，几十 MB 的聊天保存一次就让 `evaluate` 卡 30 秒，测出来的时间全是假的（`stlib.Console` 因此只挂 console 和 pageerror）。
 
 ## 没做和没验证的
 
@@ -126,4 +126,4 @@ ST_DIR=~/st KEEP_ST=1 tests/run.sh t5
 7. 上游报告：草稿在 `docs/upstream-bug-report.md`，还没发到 SillyTavern 的 issues。
 8. 小海螺（ipe）每次重载/切后台重写正文且内容不一样，导致小锚不停存快照、酒馆不停往服务器存。要在小海螺的仓库里改成幂等（见上面「改了什么」一段）。可用 `ChatAnchor.diff(newId, oldId)` 验证改完后两次注入是否还有差异。用户说 Image Atelier 已在另一个会话里改过。
 9. 50 MB 的聊天：v1.2.5 改成增量重算（见「快照」一段）。
-10. 大聊天基线（`FLOORS=824 WORDS=1500 EXTRA_KB=40 tests/run.sh t8`，43.3 MB，本机 Chromium）：改前没变化重算 458 ms（27.5 MB 时）、每份快照 400 ms；改后没变化重算 14 ms、改一楼 72 ms、连续 15 份平均 29 ms/份。首次打开仍要全量：酒馆打开 2.4 秒 + 小锚首次快照 1.4 秒。`loadSnapData` 改成按 chatKey 整批 `getAll` 再挑，43 MB 读出来 304 ms（原来逐楼 get）。**覆盖恢复在 43 MB 上仍要 35 秒**，不在读库，还没拆开看是哪一步（见 `tests/out` 里 t8 的分段计时）。
+10. 大聊天基线（`FLOORS=824 WORDS=1500 EXTRA_KB=40 tests/run.sh t8`，43.3 MB，本机 Chromium）：改前没变化重算 458 ms（27.5 MB 时）、每份快照 400 ms；改后没变化重算 17 ms、改一楼 17 ms、连续 15 份平均 31 ms/份。首次打开仍要全量：酒馆打开 2.5 秒 + 小锚首次快照 1.3 秒。`loadSnapData` 改成按 chatKey 整批 `getAll` 再挑，43 MB 读出来 0.37 秒（原来逐楼 get）。覆盖恢复 6.7 秒，其中酒馆自己的上传 3.5 秒 + 重载 2.3 秒；恢复成新聊天 3.8 秒。之前测出的「35 秒」是测试工具的假象（见测试注意事项）。
