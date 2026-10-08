@@ -244,6 +244,10 @@ def main():
         pg.click('.ca-panel .ca-tab[data-tab="set"]')
         pg.wait_for_selector('.ca-panel input[data-set="recent"]')
         C.ok(pg.input_value('.ca-panel input[data-set="recent"]') == '12', '设置页显示默认值')
+        import json as _json
+        manifest_ver = _json.load(open(Path(__file__).parent.parent / 'manifest.json', encoding='utf-8'))['version']
+        shown = pg.get_attribute('.ca-panel .ca-foot', 'data-version')
+        C.ok(shown == manifest_ver and 'Claude' in pg.inner_text('.ca-panel .ca-foot') and 'Claude' in pg.inner_text('.ca-panel .ca-title'), '设置页版本号和 manifest 一致，署名在标题和页脚', f'shown={shown} manifest={manifest_ver}')
         pg.click('.ca-panel .ca-tab[data-tab="cur"]')
         pg.wait_for_selector('.ca-panel .ca-snap')
         before = len(L.snaps(pg))

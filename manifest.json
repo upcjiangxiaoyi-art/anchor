@@ -5,8 +5,8 @@
     "optional": [],
     "js": "index.js",
     "css": "style.css",
-    "author": "",
-    "version": "1.2.5",
+    "author": "江 & Claude (Anthropic)",
+    "version": "1.2.6",
     "homePage": "",
     "auto_update": false
 }

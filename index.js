@@ -12,6 +12,7 @@
  */
 
 const EXT = 'chat_anchor';
+const VERSION = '1.2.6'; // 和 manifest.json 保持一致（测试会核对）
 const TAG = '[小锚]';
 const DB_NAME = 'ST_ChatAnchor';
 const DB_VER = 1;
@@ -1172,7 +1173,7 @@ async function render() {
     const top = scroller?.scrollTop ?? 0;
     root.innerHTML = `
         <header class="ca-head">
-            <div class="ca-title"><i class="fa-solid fa-anchor"></i><span>小锚</span></div>
+            <div class="ca-title"><i class="fa-solid fa-anchor"></i><span>小锚</span><small class="ca-by" title="由 Claude（Anthropic）和江一起做的">by Claude</small></div>
             <div class="menu_button" data-act="snap-now" title="给当前聊天存一份并锁定">立即快照</div>
         </header>
         <nav class="ca-tabs" role="tablist">${tabs.map(([id, label]) => `<button type="button" class="ca-tab" role="tab" aria-selected="${P.tab === id}" data-act="tab" data-tab="${id}">${label}</button>`).join('')}</nav>
@@ -1352,7 +1353,8 @@ async function renderSettings() {
         + num('maxChats', '最多保留几个聊天', '超出后清掉最久没动的聊天（有锁定快照的不清）', 3, 200)
         + `<label class="ca-row is-stack"><span><b>忽略这些字段的变化</b><small>别的扩展往消息里写的记账信息（比如 extra.stImageAtelier）单独变了不存快照。逗号分隔；点快照旁的「改了什么」可以直接加。</small></span><input type="text" class="text_pole" data-set="ignore" value="${esc(st.ignore.join(', '))}" placeholder="无"></label>`
         + `<div class="ca-note">现在有 ${chats.length} 个聊天、${snaps} 份快照${usage}。<br>快照存在这台设备的浏览器里：换设备、清除网站数据、卸载 App 后就没有了。重要的聊天请用「导出」另存一份。</div>
-        <div class="ca-banner-acts"><div class="menu_button" data-act="wipe">清空全部快照</div></div>`;
+        <div class="ca-banner-acts"><div class="menu_button" data-act="wipe">清空全部快照</div></div>
+        <div class="ca-note ca-foot" data-version="${VERSION}">小锚 ${VERSION} · 由 Claude（Anthropic）和江一起做的</div>`;
 }
 
 function onPanelChange(e) {
