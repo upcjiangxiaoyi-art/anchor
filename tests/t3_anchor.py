@@ -364,6 +364,24 @@ def main():
         spy.remove()
         pg.evaluate('() => { ChatAnchor.state.gzipBroken = false; ChatAnchor.state.gzipAbove = 4 * 1048576; }')
 
+        # ───────── L 体检（1.2.8） ─────────
+        C.section('L 体检')
+        L.ev(pg, 'for (const i of [3, 4, 5]) { const m = ctx.chat[i]; m.extra = { ...(m.extra || {}), fake_ext: "x".repeat(200000) }; }')
+        d = pg.evaluate('async () => await ChatAnchor.checkup()')
+        C.ok(d['count'] == L.chat_len(pg) and d['fields'][0]['key'] == 'extra.fake_ext' and 550000 < d['fields'][0]['bytes'] < 650000 and d['fields'][0]['own'] is False, 'L1 按字段称重：塞进去的扩展字段排第一、约 600 KB、标为非酒馆字段', str(d['fields'][:2]))
+        C.ok(d['heavy'][0]['index'] in (3, 4, 5) and d['heavy'][0]['top'] == 'extra.fake_ext', 'L2 最重的楼和它最重的字段找对了', str(d['heavy'][:1]))
+        C.ok(d['extBytes'] > d['bytes'] * 0.2 and '让那个扩展把数据存到自己的文件里' in pg.evaluate('(d) => ChatAnchor.checkupText(d)', d), 'L3 扩展数据占比高时报告里给出建议')
+        pg.evaluate('() => ChatAnchor.open("cur")')
+        pg.wait_for_selector('.ca-panel [data-act="checkup"]')
+        pg.click('.ca-panel [data-act="checkup"]')
+        pg.wait_for_selector('dialog[open] .ca-check', timeout=15000)
+        txt = L.dialog_text(pg)
+        C.ok('体检' in txt and 'extra.fake_ext' in txt and '最重的楼' in txt, 'L4 面板里点「体检」弹出报告', txt[:160])
+        pg.screenshot(path=str(OUT / 't3_checkup.png'))
+        pg.keyboard.press('Escape')
+        time.sleep(0.4)
+        close_panel(pg)
+
         warns = [t for ty, t in con.lines if ty == 'warning' and '[小锚]' in t]
         C.ok(not warns, '小锚全程没有输出过警告', str(warns[:3]))
         C.ok(not [e for e in con.errors if 'Internal S' not in e], '页面没有未捕获的异常（horde 的 500 除外）', str(con.errors[:3]))

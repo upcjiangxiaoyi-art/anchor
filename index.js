@@ -12,7 +12,7 @@
  */
 
 const EXT = 'chat_anchor';
-const VERSION = '1.2.7'; // 和 manifest.json 保持一致（测试会核对）
+const VERSION = '1.2.8'; // 和 manifest.json 保持一致（测试会核对）
 const TAG = '[小锚]';
 const DB_NAME = 'ST_ChatAnchor';
 const DB_VER = 1;
@@ -867,6 +867,92 @@ async function legacyImport(chatKey, timestamp, { ask = true } = {}) {
     return chatName;
 }
 
+// ───────────────────────── 体检：这个聊天多大、什么占的 ─────────────────────────
+const fieldLabel = k => FIELD_NAMES[k] ? `${FIELD_NAMES[k]}（${k}）` : (k.startsWith('extra.') ? `扩展写的 ${k}` : k);
+const ST_OWN = new Set(['mes', 'swipes', 'swipe_info', 'swipe_id', 'name', 'is_user', 'is_system', 'send_date', 'force_avatar', 'gen_started', 'gen_finished', 'extra.reasoning', 'extra.reasoning_duration', 'extra.token_count', 'extra.api', 'extra.model', 'extra.display_text', 'extra.image', 'extra.title', 'extra.bias', 'extra.memory', 'extra.inline_image', 'extra.media', 'extra.reasoning_type', 'extra.isSmallSys', 'extra.type']);
+
+/** 在内存里把当前聊天按字段称一遍重。不碰服务器。几十 MB 的聊天手机上要几秒。 */
+async function checkup() {
+    const info = currentChat();
+    if (!info) throw new Error('先打开一个聊天');
+    const c = ctx();
+    const msgs = c.chat;
+    const enc = new TextEncoder();
+    const fields = new Map();
+    const heavy = [];
+    let chars = 0, bytes = 0;
+    let t0 = performance.now();
+    for (let i = 0; i < msgs.length; i++) {
+        const m = msgs[i];
+        const j = JSON.stringify(m) ?? 'null';
+        chars += j.length;
+        bytes += enc.encode(j).byteLength;
+        let topKey = '', topN = 0;
+        if (m && typeof m === 'object') {
+            for (const k of Object.keys(m)) {
+                const v = m[k];
+                if (k === 'extra' && v && typeof v === 'object') {
+                    for (const ek of Object.keys(v)) { const n = (JSON.stringify(v[ek]) ?? '').length; const key = 'extra.' + ek; fields.set(key, (fields.get(key) || 0) + n); if (n > topN) { topN = n; topKey = key; } }
+                } else { const n = (JSON.stringify(v) ?? '').length; fields.set(k, (fields.get(k) || 0) + n); if (n > topN) { topN = n; topKey = k; } }
+            }
+        }
+        heavy.push({ index: i, chars: j.length, top: topKey, topChars: topN });
+        if (performance.now() - t0 > 10) { await tick(); t0 = performance.now(); }
+    }
+    const ratio = chars ? bytes / chars : 1; // 字符数换算成字节数（中文一个字 3 字节）
+    const metaObj = c.chatMetadata ?? {};
+    const metaJson = JSON.stringify(metaObj);
+    const metaBytes = enc.encode(metaJson).byteLength;
+    const metaFields = Object.keys(metaObj).map(k => ({ key: k, bytes: Math.round((JSON.stringify(metaObj[k]) ?? '').length * ratio) })).sort((a, b) => b.bytes - a.bytes);
+    let gzBytes = null;
+    if (bytes > 1048576 && typeof CompressionStream === 'function') { // 估一下压缩后多大（和「大聊天保存时压缩」发出去的大小一致）
+        try {
+            let idx = -1;
+            const rs = new ReadableStream({ pull(ctrl) { if (idx >= msgs.length) { ctrl.close(); return; } ctrl.enqueue(enc.encode((idx < 0 ? metaJson : JSON.stringify(msgs[idx]) ?? 'null') + '\n')); idx++; } });
+            const reader = rs.pipeThrough(new CompressionStream('gzip')).getReader();
+            let n = 0;
+            for (;;) { const { done, value } = await reader.read(); if (done) break; n += value.byteLength; }
+            gzBytes = n;
+        } catch { gzBytes = null; }
+    }
+    heavy.sort((a, b) => b.chars - a.chars);
+    const list = [...fields].map(([key, n]) => ({ key, bytes: Math.round(n * ratio), own: ST_OWN.has(key) })).sort((a, b) => b.bytes - a.bytes);
+    const extBytes = list.filter(f => !f.own).reduce((a, f) => a + f.bytes, 0);
+    return {
+        chatName: info.chatName, owner: info.owner, count: msgs.length, bytes: bytes + metaBytes, gzBytes, extBytes,
+        fields: list, meta: { bytes: metaBytes, fields: metaFields },
+        heavy: heavy.slice(0, 5).map(h => ({ index: h.index, bytes: Math.round(h.chars * ratio), top: h.top, topBytes: Math.round(h.topChars * ratio) })),
+    };
+}
+
+function checkupText(d) {
+    const pct = n => d.bytes ? Math.round(n / d.bytes * 100) : 0;
+    const lines = [`小锚体检 · 「${d.chatName}」 ${d.count} 楼`, `整份 ${fmtSize(d.bytes)}${d.gzBytes ? `，压缩后约 ${fmtSize(d.gzBytes)}` : ''}。酒馆每次保存都整份上传。`, '什么占地方：'];
+    for (const f of d.fields.slice(0, 10)) lines.push(`  ${String(pct(f.bytes)).padStart(3)}%  ${fmtSize(f.bytes).padStart(8)}  ${fieldLabel(f.key)}`);
+    if (d.meta.bytes > 10240) lines.push(`  ${String(pct(d.meta.bytes)).padStart(3)}%  ${fmtSize(d.meta.bytes).padStart(8)}  聊天设置（元数据）：${d.meta.fields.slice(0, 3).map(f => `${f.key} ${fmtSize(f.bytes)}`).join('，')}`);
+    lines.push('最重的楼：' + d.heavy.map(h => `第 ${h.index + 1} 楼 ${fmtSize(h.bytes)}（${h.top}）`).join('、'));
+    if (d.extBytes > d.bytes * 0.2) lines.push(`别的扩展写进楼里的数据占了 ${pct(d.extBytes)}%。让那个扩展把数据存到自己的文件里、楼里只留引用，文件就能瘦一大截。`);
+    return lines.join('\n');
+}
+
+async function showCheckup(d) {
+    const c = ctx();
+    const pct = n => d.bytes ? Math.round(n / d.bytes * 100) : 0;
+    const rows = d.fields.slice(0, 8).map(f => `<li><span>${esc(fieldLabel(f.key))}</span><b>${fmtSize(f.bytes)} · ${pct(f.bytes)}%</b></li>`).join('')
+        + (d.meta.bytes > 10240 ? `<li><span>聊天设置（元数据）${esc(d.meta.fields.slice(0, 2).map(f => f.key).join('、'))}</span><b>${fmtSize(d.meta.bytes)} · ${pct(d.meta.bytes)}%</b></li>` : '');
+    const html = `<div class="ca-dialog"><h3>「${esc(d.chatName)}」体检</h3>
+        <p>${d.count} 楼，整份 <b>${fmtSize(d.bytes)}</b>${d.gzBytes ? `，压缩后约 <b>${fmtSize(d.gzBytes)}</b>` : ''}。酒馆每次保存都整份上传这么多。</p>
+        <p><b>什么占地方</b></p><ol class="ca-check">${rows}</ol>
+        <p><b>最重的楼</b>：${d.heavy.map(h => `第 ${h.index + 1} 楼 ${fmtSize(h.bytes)}（${esc(h.top)}）`).join('、')}</p>
+        <p class="ca-note">楼数不是问题，每楼的重量才是。${d.extBytes > d.bytes * 0.2 ? `别的扩展写进楼里的数据占了 ${pct(d.extBytes)}%：让那个扩展把数据存到自己的文件里、楼里只留引用，文件就能瘦一大截。` : '这个聊天大部分是正文本身，没什么可卸的包袱。'}</p></div>`;
+    const res = await c.callGenericPopup(html, c.POPUP_TYPE.TEXT, '', { okButton: '关闭', cancelButton: false, allowVerticalScrolling: true, customButtons: [{ text: '复制报告', result: 2 }] });
+    if (res === 2) {
+        const text = checkupText(d);
+        try { await navigator.clipboard.writeText(text); toast('success', '报告已复制。'); }
+        catch { await c.callGenericPopup(Object.assign(document.createElement('textarea'), { className: 'text_pole ca-preview', value: text, readOnly: true }), c.POPUP_TYPE.TEXT, '', { wide: true, okButton: '关闭' }); }
+    }
+}
+
 // ───────────────────────── 两份快照差在哪 ─────────────────────────
 const FIELD_NAMES = {
     mes: '正文', swipe_id: '当前是第几个 swipe', swipes: 'swipe 列表', swipe_info: 'swipe 附带信息', name: '名字', send_date: '发送时间',
@@ -1221,6 +1307,7 @@ async function renderTimeline(key, info, withBack) {
     const owner = rec?.owner || info?.owner || '';
     const chatName = rec?.chatName || info?.chatName || '';
     let html = `${back}<div class="ca-chat-name">${esc(owner)}</div><div class="ca-chat-file">${esc(chatName)}${isCur ? '' : '（不是当前打开的聊天）'}</div>`;
+    if (isCur) html += '<button type="button" class="ca-back" data-act="checkup"><i class="fa-solid fa-stethoscope"></i>体检：这个聊天多大、什么占的</button>';
 
     const p = S.poison.get(key);
     if (isCur && p && p.confirmed && !p.okSeen && !p.released) {
@@ -1418,6 +1505,7 @@ async function onPanelClick(e) {
     if (act === 'back') { P.viewKey = null; return refreshPanel(); }
     if (act === 'view') { P.viewKey = el.dataset.key; return refreshPanel(); }
     if (act === 'reload') { await closePanel(); return ctx().reloadCurrentChat(); }
+    if (act === 'checkup') { toast('info', '正在体检，大聊天要几秒…', { timeOut: 2500 }); return showCheckup(await checkup()); }
     if (act === 'snap-now') {
         if (!currentChat()) return toast('info', '先打开一个聊天。');
         const snap = await takeSnapshot('manual', { force: true, lock: true });
@@ -1585,7 +1673,7 @@ globalThis.ChatAnchor = {
     list: async key => snapsOf(key || currentChat()?.key),
     stats: async () => ({ chats: (await dbAll('chats')).length, snaps: (await dbAll('snaps')).length, blobs: (await blobKeysOf(currentChat()?.key)).length }),
     log: () => dbAll('log'),
-    diff: diffSnaps, loadSnapData, getSnap,
+    diff: diffSnaps, loadSnapData, getSnap, checkup, checkupText,
     legacy: { list: legacyList, importAsNew: legacyImport, exportFile: legacyExport },
     server: { list: serverBackups, restore: serverRestore, keyOf: backupKeyOf, sha256: sha256Hex },
     state: S,

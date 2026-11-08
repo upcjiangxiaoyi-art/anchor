@@ -60,6 +60,8 @@ v1.2.5 起是**增量**的（用户的主聊天 48 MiB，每次全量 stringify 
 
 用户随后又发来四张弹窗：新增楼 + `lastInContextMessageId`（正常收到回复）；`extra.reasoning`/`reasoning_duration`/`token_count`/`gen_finished`/`swipe_info` + 正文（重新生成或换 swipe）；以及两张来自她自己的扩展**小海螺（ipe）**：`extra.ipe_inject_env / ipe_inject_desc / ipe_inject_layers`、`extra.stImageAtelier`、**正文 `mes` 和 `swipes`** 都变了，元数据里 `ipe_img_layers_v1`、`ipe_ledger_v2`、`ipe_ledger_src_v1` 也变了，而且用户没操作、相隔 13 分钟（切后台回来）又来一次。结论：小海螺在页面重载/切聊天时重新注入，且每次写出的正文不完全一样（否则哈希相同不会存）。这类快照是真实内容变化，不该加进忽略列表；真正该改的是小海螺本身（写前比较、注入文本不带时间戳/随机值、重载时不重写、内容没变不调 saveChat——它每改一次正文酒馆就往服务器存一次并生成一份备份，和服务器备份目录撑爆直接相关）。她另一个扩展叫小红霞（arrebol）。小海螺的仓库不在这个会话里，她会另开会话处理。弹窗提示语 v1.2.4 之后会按情况区分：新增/删除楼、重新生成、别的扩展写的字段（并指出它是否也改了正文）。
 
+**体检**（v1.2.8）：用户的用户都是超长楼层，楼数砍不了，但 50 MB 里正文只占 8 MB，大头是扩展塞进 `extra` 的数据。`checkup()` 在内存里逐楼 `JSON.stringify`，按顶层字段和 `extra.*` 分项累加字符数，用整份字节数/字符数的比例换算成字节；`ST_OWN` 列出酒馆自己的字段，其余 `extra.*` 算"扩展写的"并汇总成 `extBytes`；最重的 5 楼及各自最重的字段；大于 1 MB 时用 `CompressionStream` 流式估一个 gzip 后的大小（和「大聊天保存时压缩」发出去的一致）。入口在「当前」页聊天名下面，弹窗带「复制报告」（`checkupText()` 纯文本）。几十 MB 的聊天要 stringify 两三遍，手机上几秒，所以是手动触发。
+
 **补存**：保存请求失败 → 记录状态码和响应体 → 3 / 8 / 20 秒后调 `ctx.saveChat()`。integrity 错误不重试，酒馆自己会弹窗。
 
 **大请求体自动压缩**（v1.2.7）：2026-11-08 用户的保存全部 413——上个月改的 nginx 500m 被重置回 50m（1Panel 会重写 nginx.conf），聊天刚过 50 MiB。酒馆自己的 `compressRequest` 只压 `minPayloadSize`（256kb）到 `maxPayloadSize`（**默认 8mb**）之间的请求体，且 worker 3 秒超时，所以几十 MB 的聊天一直裸着发。服务器端是 `bodyParser.json({ limit: '500mb' })`，`inflate` 默认开，无条件接受 `Content-Encoding: gzip`。于是守门的保存分支改走 `sendSave()`：请求体是字符串（酒馆没压过）且超过 `S.gzipAbove`（4 MiB）就用 `CompressionStream('gzip')` 压一遍再发，头里加 `Content-Encoding: gzip`（`classify` 在压缩前已经从字符串里拿到了文件名）；服务器回 400/415 且不是 integrity 错误 → 置 `S.gzipBroken`，原样重发一次，之后不再压；任何异常都原样发。设置 `gzipSaves` 默认开。本机 43.3 MB 的测试聊天：压到 4.7 MB，压缩 + 本地上传共 1.5 秒（测试文本重复度高，真实聊天估计压到 15–25%）。注意「恢复成新聊天」走 multipart 的 `/api/chats/import`，压不了，大聊天在反代限制没放开前只能用「覆盖当前聊天」。
@@ -108,7 +110,7 @@ ST_DIR=~/st KEEP_ST=1 tests/run.sh t5
 
 - `stlib.py`：公共库。iPhone 视口 390×844 + 触摸；`Fault` 用 Playwright 路由让某个接口断网 / 返回指定状态码（回调里不能 sleep，会卡住同步 API）；`slow_fetch` 在页面里给 fetch 加延迟模拟慢服务器；磁盘聊天文件读写；`Checks` 计数。
 - `t1_rootcause.py`：不装小锚复现根因，两条路径（断网 reload / 502 openCharacterChat），10 项。
-- `t3_anchor.py`：A 自动快照，B 去重和跳过，C 断网读取失败，D 502 读取失败，I 第三方读取失败不误拦（含 21 秒等标记作废），E 保存失败补存，F 掉楼检测和覆盖恢复，G 恢复成新聊天，H 面板（含「改了什么」标签、弹窗、忽略字段），J 增量重算，K 大请求体自动压缩，82 项。
+- `t3_anchor.py`：A 自动快照，B 去重和跳过，C 断网读取失败，D 502 读取失败，I 第三方读取失败不误拦（含 21 秒等标记作废），E 保存失败补存，F 掉楼检测和覆盖恢复，G 恢复成新聊天，H 面板（含「改了什么」标签、弹窗、忽略字段），J 增量重算，K 大请求体自动压缩，L 体检，86 项。
 - `t4_legacy.py`：旧插件备份救援，8 项。
 - `t5_server.py`：服务器备份页。前 7 项是 1.2.0 的（中文文件名角色卡 `韩川央.png` 自动复制、跑完删掉），然后是 1.2.1 的慢服务器不卡面板 / 只发一个请求，1.2.2 的刷新页面后直接用记住的列表 / 504 给处理办法，最后是超时提示保留旧列表，21 项。
 - `t6_group.py`：群聊根因复现 + 守门（断网、502 两条路径）+ 掉楼 + 两种恢复，33 项，约 3 分钟。用户说群聊优先级低，但代码已经验证过能跑。

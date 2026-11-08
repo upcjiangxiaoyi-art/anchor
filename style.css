@@ -99,3 +99,8 @@
 .ca-chat.ca-old .ca-prev { margin: 6px 0 8px; }
 
 .ca-chev { color: var(--ca-muted); }
+
+/* 体检报告 */
+.ca-check { list-style: none; margin: 4px 0 10px; padding: 0; }
+.ca-check li { display: flex; justify-content: space-between; gap: 10px; padding: 5px 0; border-bottom: 1px solid var(--ca-faint); overflow-wrap: anywhere; }
+.ca-check li b { white-space: nowrap; font-variant-numeric: tabular-nums; }
