@@ -62,7 +62,7 @@ v1.2.5 起是**增量**的（用户的主聊天 48 MiB，每次全量 stringify 
 
 **补存**：保存请求失败 → 记录状态码和响应体 → 3 / 8 / 20 秒后调 `ctx.saveChat()`。integrity 错误不重试，酒馆自己会弹窗。
 
-**大请求体自动压缩**（v1.2.7）：2026-11-08 用户的保存全部 413——上个月改的 nginx 500m 被重置回 50m（1Panel 会重写 nginx.conf），聊天刚过 50 MiB。酒馆自己的 `compressRequest` 只压 `minPayloadSize`（256kb）到 `maxPayloadSize`（**默认 8mb**）之间的请求体，且 worker 3 秒超时，所以几十 MB 的聊天一直裸着发。服务器端是 `bodyParser.json({ limit: '500mb' })`，`inflate` 默认开，无条件接受 `Content-Encoding: gzip`。于是守门的保存分支改走 `sendSave()`：请求体是字符串（酒馆没压过）且超过 `S.gzipAbove`（4 MiB）就用 `CompressionStream('gzip')` 压一遍再发，头里加 `Content-Encoding: gzip`（`classify` 在压缩前已经从字符串里拿到了文件名）；服务器回 400/415 且不是 integrity 错误 → 置 `S.gzipBroken`，原样重发一次，之后不再压；任何异常都原样发。设置 `gzipSaves` 默认开。注意「恢复成新聊天」走 multipart 的 `/api/chats/import`，压不了，大聊天在反代限制没放开前只能用「覆盖当前聊天」。
+**大请求体自动压缩**（v1.2.7）：2026-11-08 用户的保存全部 413——上个月改的 nginx 500m 被重置回 50m（1Panel 会重写 nginx.conf），聊天刚过 50 MiB。酒馆自己的 `compressRequest` 只压 `minPayloadSize`（256kb）到 `maxPayloadSize`（**默认 8mb**）之间的请求体，且 worker 3 秒超时，所以几十 MB 的聊天一直裸着发。服务器端是 `bodyParser.json({ limit: '500mb' })`，`inflate` 默认开，无条件接受 `Content-Encoding: gzip`。于是守门的保存分支改走 `sendSave()`：请求体是字符串（酒馆没压过）且超过 `S.gzipAbove`（4 MiB）就用 `CompressionStream('gzip')` 压一遍再发，头里加 `Content-Encoding: gzip`（`classify` 在压缩前已经从字符串里拿到了文件名）；服务器回 400/415 且不是 integrity 错误 → 置 `S.gzipBroken`，原样重发一次，之后不再压；任何异常都原样发。设置 `gzipSaves` 默认开。本机 43.3 MB 的测试聊天：压到 4.7 MB，压缩 + 本地上传共 1.5 秒（测试文本重复度高，真实聊天估计压到 15–25%）。注意「恢复成新聊天」走 multipart 的 `/api/chats/import`，压不了，大聊天在反代限制没放开前只能用「覆盖当前聊天」。
 
 **恢复**
 - 新聊天：`/api/chats/import`（multipart，文件字段名必须是 `avatar`），再 `openCharacterChat`
