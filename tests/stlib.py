@@ -280,7 +280,9 @@ def dialog_text(page):
 
 
 def click_dialog_button(page, text):
-    page.locator('dialog[open] .popup-button-ok, dialog[open] .popup-button-cancel, dialog[open] .popup-button-custom, dialog[open] .menu_button').filter(has_text=text).first.click()
+    """点最上层弹窗里的某个按钮。小锚面板本身也是 dialog，里面有隐藏的 ok/cancel，所以只认可见的、取最后一个（最上层）。"""
+    loc = page.locator('dialog[open] .popup-button-ok, dialog[open] .popup-button-cancel, dialog[open] .popup-button-custom, dialog[open] .menu_button').filter(has_text=text).locator('visible=true')
+    loc.last.click()
 
 
 # ───────────────────────── 故障注入 ─────────────────────────

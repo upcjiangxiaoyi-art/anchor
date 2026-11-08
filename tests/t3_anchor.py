@@ -382,6 +382,61 @@ def main():
         time.sleep(0.4)
         close_panel(pg)
 
+        # ───────── M 瘦身（1.2.9） ─────────
+        C.section('M 瘦身')
+        cur_name = L.chat_id(pg)
+        n_all = L.chat_len(pg)
+        # 造数据：前 100 楼每楼一份重复 swipe 副本；100–110 楼带备选；前 50 楼和最后一楼带思维链
+        L.ev(pg, '''const n = ctx.chat.length;
+            for (let i = 0; i < 100; i++) { const m = ctx.chat[i]; m.swipe_id = 0; m.swipes = [m.mes]; m.swipe_info = [{ send_date: m.send_date, extra: {} }]; }
+            for (let i = 100; i <= 110; i++) { const m = ctx.chat[i]; m.swipe_id = 0; m.swipes = [m.mes, '备选 ' + i]; m.swipe_info = [{}, {}]; }
+            for (let i = 0; i < 50; i++) { ctx.chat[i].extra = { ...(ctx.chat[i].extra || {}), reasoning: '想了想 ' + i, reasoning_duration: 1200 }; }
+            ctx.chat[n - 1].extra = { ...(ctx.chat[n - 1].extra || {}), reasoning: '最后一楼的思考' };
+            await ctx.saveChat();''')
+        time.sleep(0.5)
+        # 前面的测试步骤（/sendas、恢复等）已经给一些楼留了 swipes，所以期望值按页面里实际的数来
+        exp = L.ev(pg, '''const end = ctx.chat.length - 50; const old = ctx.chat.slice(0, end);
+            return { dup: old.filter(m => Array.isArray(m.swipes) && m.swipes.length <= 1).length, alt: old.filter(m => Array.isArray(m.swipes) && m.swipes.length > 1).length,
+                     reasoning: old.filter(m => m.extra && (m.extra.reasoning || m.extra.reasoning_duration != null)).length,
+                     targets: old.filter(m => (Array.isArray(m.swipes) && m.swipes.length <= 1) || (m.extra && (m.extra.reasoning || m.extra.reasoning_duration != null))).length };''')
+        plan = pg.evaluate('async () => await ChatAnchor.slim({ dryRun: true })')
+        C.ok(plan['dup']['floors'] == exp['dup'] >= 100 and plan['alt']['floors'] == exp['alt'] == 11 and plan['alt']['count'] == 11 and plan['reasoning']['floors'] == exp['reasoning'] == 50 and plan['applied'] == 0, 'M1 只算不改：副本、备选、思维链各几楼都数对，最后一楼不在范围内', str({k: plan[k] for k in ('dup', 'alt', 'reasoning', 'end')}) + ' exp=' + str(exp))
+        before = L.floors(cur_name)
+        r = pg.evaluate('async () => await ChatAnchor.slim({})')
+        L.wait_js(pg, f'ctx.chat.length === {n_all}', timeout=30000)
+        time.sleep(1)
+        rows = L.read_chat(cur_name)
+        C.ok(r['saved'] is True and r['applied'] == exp['targets'] and L.floors(cur_name) == before, 'M2 默认瘦身：保存成功、楼数不变、动的楼数和计划一致', f"saved={r['saved']} applied={r['applied']} exp={exp['targets']} floors={L.floors(cur_name)}")
+        C.ok('swipes' not in rows[1 + 5] and 'reasoning' not in rows[1 + 5].get('extra', {}) and 'swipe_id' not in rows[1 + 5], 'M3 老楼的重复副本和思维链被清掉')
+        C.ok(len(rows[1 + 105].get('swipes', [])) == 2, 'M4 备选回复默认保留')
+        C.ok(rows[-1].get('extra', {}).get('reasoning') == '最后一楼的思考', 'M5 最近 50 楼一字不动')
+        s_ = L.snaps(pg)
+        pre = next((x for x in s_ if x['lockReason'] == 'pre-slim'), None)
+        C.ok(pre and pre['locked'] and pre['count'] == n_all, 'M6 瘦身前存了锁定快照', str(pre))
+        C.ok(any(x['type'] == '瘦身' and '重复 swipe 副本' in x['msg'] and '思维链 50 楼' in x['msg'] for x in L.ca_log(pg)), 'M7 记录里写了清掉多少', str([x['msg'][:120] for x in L.ca_log(pg) if x['type'] == '瘦身']))
+        r2 = pg.evaluate('async () => await ChatAnchor.slim({ dropDup: false, dropReasoning: false, dropAlternates: true })')  # 重载后酒馆会给渲染到的老楼补回副本，所以这里只清备选
+        L.wait_js(pg, f'ctx.chat.length === {n_all}', timeout=30000)
+        time.sleep(1)
+        rows = L.read_chat(cur_name)
+        C.ok(r2['applied'] == 11 and 'swipes' not in rows[1 + 105], 'M8 勾上备选后，备选也清掉', f"applied={r2['applied']} row106_swipes={rows[1 + 105].get('swipes')}")
+        saved = pg.evaluate('async (id) => await ChatAnchor.restoreInPlace(id)', pre['id'])
+        L.wait_js(pg, f'ctx.chat.length === {n_all}', timeout=30000)
+        time.sleep(1)
+        rows = L.read_chat(cur_name)
+        C.ok(saved is True and rows[1 + 5].get('swipes') == [rows[1 + 5]['mes']] and rows[1 + 5]['extra'].get('reasoning') == '想了想 5' and len(rows[1 + 105]['swipes']) == 2, 'M9 用「瘦身前」快照恢复，副本、思维链、备选全回来')
+        pg.evaluate('() => ChatAnchor.open("cur")')
+        pg.wait_for_selector('.ca-panel [data-act="checkup"]')
+        pg.click('.ca-panel [data-act="checkup"]')
+        pg.wait_for_selector('dialog[open] .ca-check', timeout=15000)
+        L.click_dialog_button(pg, '瘦身')
+        pg.wait_for_selector('dialog[open] input[data-slim="dup"]', timeout=15000)
+        txt = L.dialog_text(pg)
+        C.ok('重复的 swipe 副本' in txt and '老楼的思维链' in txt and '清完约' in txt and pg.is_checked('dialog[open] input[data-slim="dup"]') and pg.is_checked('dialog[open] input[data-slim="reasoning"]') and not pg.is_checked('dialog[open] input[data-slim="alt"]'), 'M10 体检弹窗 → 瘦身对话框：三项都在，副本/思维链默认勾、备选默认不勾', txt.replace(chr(10), ' ')[:200])
+        pg.screenshot(path=str(OUT / 't3_slim.png'))
+        L.click_dialog_button(pg, '取消')
+        time.sleep(0.4)
+        close_panel(pg)
+
         warns = [t for ty, t in con.lines if ty == 'warning' and '[小锚]' in t]
         C.ok(not warns, '小锚全程没有输出过警告', str(warns[:3]))
         C.ok(not [e for e in con.errors if 'Internal S' not in e], '页面没有未捕获的异常（horde 的 500 除外）', str(con.errors[:3]))
