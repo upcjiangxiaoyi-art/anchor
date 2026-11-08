@@ -328,6 +328,42 @@ def main():
         full_flag = pg.evaluate('async () => (await ChatAnchor.list())[0].full')
         C.ok(full_flag is True, 'J7 删楼后的那份快照记为全量', str(full_flag))
 
+        # ───────── K 大请求体自动压缩（1.2.7；这个实例酒馆自己的压缩是关的，请求体是字符串） ─────────
+        C.section('K 大请求体自动压缩')
+        n_disk = L.floors(L.chat_id(pg))
+        cur_name = L.chat_id(pg)
+        pg.evaluate('() => { ChatAnchor.state.gzipAbove = 50 * 1024; }')  # 把阈值降到 50 KB，让 300 楼的聊天也触发
+        spy = L.Spy(pg, '**/api/chats/save')
+        slash(pg, '/send 这条保存会被小锚压缩')
+        time.sleep(1.5)
+        call = spy.calls[-1] if spy.calls else None
+        C.ok(call and call['gzip'] and call['encoding'] == 'gzip', 'K1 超过阈值的保存请求被小锚 gzip 后发出（Content-Encoding: gzip，魔数 1f8b）', str(call and (call['encoding'], call['len'])))
+        C.ok(L.floors(cur_name) == n_disk + 1, 'K2 服务器解压后正常落盘', f'floors={L.floors(cur_name)}')
+        C.ok(any(r['type'] == '压缩' and '由小锚压缩后发送' in r['msg'] for r in L.ca_log(pg)), 'K3 记录里写了压缩前后的大小')
+        spy.remove()
+        # 服务器不认压缩：一个路由既记录每个请求、又对带 gzip 的回 400（route.continue_ 直接发网络，不会再交给别的路由，所以不能分成两个）
+        seen = []
+        def reject_gzip(route, request):
+            buf = request.post_data_buffer or b''
+            gz = buf[:2] == b'\x1f\x8b'
+            seen.append(gz)
+            if gz:
+                route.fulfill(status=400, content_type='application/json', body='{"error":"bad"}')
+            else:
+                route.continue_()
+        pg.route('**/api/chats/save', reject_gzip)
+        slash(pg, '/send 这条压缩会被拒，小锚要改回原样重发')
+        time.sleep(2)
+        pg.unroute('**/api/chats/save', reject_gzip)
+        C.ok(seen == [True, False] and L.floors(cur_name) == n_disk + 2, 'K4 压缩被服务器拒绝后，立刻原样重发并成功落盘', f'calls={seen} floors={L.floors(cur_name)}')
+        C.ok(pg.evaluate('() => ChatAnchor.state.gzipBroken') is True and any(r['type'] == '压缩' and '不接受' in r['msg'] for r in L.ca_log(pg)), 'K5 之后这个会话不再压缩，并记进「记录」')
+        spy = L.Spy(pg, '**/api/chats/save')
+        slash(pg, '/send 之后的保存不再压缩')
+        time.sleep(1.5)
+        C.ok(spy.calls and not spy.calls[-1]['gzip'] and L.floors(cur_name) == n_disk + 3, 'K6 后续保存直接原样发', f'gzip={spy.calls and spy.calls[-1]["gzip"]}')
+        spy.remove()
+        pg.evaluate('() => { ChatAnchor.state.gzipBroken = false; ChatAnchor.state.gzipAbove = 4 * 1048576; }')
+
         warns = [t for ty, t in con.lines if ty == 'warning' and '[小锚]' in t]
         C.ok(not warns, '小锚全程没有输出过警告', str(warns[:3]))
         C.ok(not [e for e in con.errors if 'Internal S' not in e], '页面没有未捕获的异常（horde 的 500 除外）', str(con.errors[:3]))

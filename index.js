@@ -12,7 +12,7 @@
  */
 
 const EXT = 'chat_anchor';
-const VERSION = '1.2.6'; // 和 manifest.json 保持一致（测试会核对）
+const VERSION = '1.2.7'; // 和 manifest.json 保持一致（测试会核对）
 const TAG = '[小锚]';
 const DB_NAME = 'ST_ChatAnchor';
 const DB_VER = 1;
@@ -22,6 +22,7 @@ const DEFAULTS = Object.freeze({
     enabled: true,    // 自动快照
     guard: true,      // 读取失败时暂停保存
     retrySave: true,  // 保存失败自动重试
+    gzipSaves: true,  // 大的保存请求由小锚 gzip 后再发
     alertDrop: true,  // 掉楼提醒
     recent: 12,       // 最近 N 份无条件保留
     days: 7,          // 之后每天留 1 份，留几天
@@ -44,6 +45,9 @@ const S = {
     lastSave: new Map(),                   // key -> { ok, at, detail }
     retry: { key: null, n: 0, timer: null, toasted: false },
     msgCache: new WeakMap(),               // 消息对象 -> { fp, hash, sig, len }：大聊天只重算变过的楼
+    gzipAbove: 4 * 1048576,                // 保存请求体超过这个字节数就由小锚压缩（酒馆自己只压 8 MB 以下的）
+    gzipBroken: false,                     // 服务器不认压缩的请求体：这个会话内不再压
+    gzipLogged: new Set(),                 // 每个聊天只记一次「已压缩」
     dirty: new Set(),                      // 酒馆事件报过的楼号，下次快照必须重算
     forceFull: false,                      // 删过楼：下次快照全量重算
     lastFull: new Map(),                   // key -> 上次全量重算的时间
@@ -577,7 +581,7 @@ function installFetchGuard() {
                 try { onBlocked(info); } catch { /* 记录失败不影响拦截 */ }
                 return Promise.resolve(new Response('{"error":"chat_anchor_guard"}', { status: 409, statusText: 'Blocked by Chat Anchor', headers: { 'Content-Type': 'application/json' } }));
             }
-            const p = orig.apply(this, arguments);
+            const p = sendSave(this, arguments, input, init, info);
             p.then(r => { try { onSaveSettled(info, r, null); } catch (e) { warn(e); } }, e => { try { onSaveSettled(info, null, e); } catch (e2) { warn(e2); } });
             return p;
         }
@@ -588,6 +592,34 @@ function installFetchGuard() {
     };
     globalThis.fetch = wrapped;
     globalThis.__chatAnchorFetch = true;
+
+    /**
+     * 发保存请求。请求体太大就先 gzip：酒馆自己只压 8 MB 以下的（config 里 maxPayloadSize 默认 8mb，超时 3 秒），
+     * 更大的原样发，几十 MB 的聊天很容易撞上反代的 client_max_body_size（默认 50m）而 413。
+     * 服务器端 body-parser 自带解压，不需要任何开关。任何异常都退回原样发；服务器不认就改回原样重发一次，之后不再压。
+     */
+    async function sendSave(self, args, input, init, info) {
+        const body = init?.body;
+        const limit = Number(S.gzipAbove) || 4 * 1048576;
+        if (!settings().gzipSaves || S.gzipBroken || typeof body !== 'string' || body.length < limit || typeof CompressionStream !== 'function') return orig.apply(self, args);
+        let gzInit, before, after;
+        try {
+            const bytes = new TextEncoder().encode(body);
+            const gz = new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer());
+            const headers = new Headers(init.headers || {});
+            headers.set('Content-Encoding', 'gzip');
+            gzInit = { ...init, headers, body: gz };
+            before = bytes.length; after = gz.length;
+        } catch (e) { warn('压缩保存请求失败，原样发送', e); return orig.apply(self, args); }
+        if (!S.gzipLogged.has(info.key)) { S.gzipLogged.add(info.key); logEvent('压缩', `「${nameOf(info.key)}」的保存请求 ${fmtSize(before)} → ${fmtSize(after)}，由小锚压缩后发送`); }
+        const r = await orig.call(self, input, gzInit);
+        if (r.status !== 400 && r.status !== 415) return r;
+        const text = await r.clone().text().catch(() => '');
+        if (/"integrity"/.test(text)) return r; // 完整性错误和压缩无关，交给酒馆自己处理
+        S.gzipBroken = true;
+        logEvent('压缩', `服务器不接受压缩的保存请求（HTTP ${r.status}），已改回原样发送，这次会话不再压缩`);
+        return orig.apply(self, args);
+    }
 }
 
 // ───────────────────────── 恢复 / 导出 / 预览 ─────────────────────────
@@ -1348,6 +1380,7 @@ async function renderSettings() {
         + toggle('enabled', '自动快照', '发消息、收到回复、编辑、删除之后各存一份，内容没变就跳过')
         + toggle('alertDrop', '掉楼提醒', '打开聊天时发现比上次快照少楼，弹出提示')
         + toggle('retrySave', '保存失败自动重试', '没存上服务器时，隔 3 秒、8 秒、20 秒各再试一次')
+        + toggle('gzipSaves', '大聊天保存时压缩', '保存请求超过 4 MB 就由小锚压缩后再发（酒馆自己只压 8 MB 以下的）。能绕过反代的大小限制，手机上也省流量')
         + num('recent', '最近保留几份', '最新的这几份一定留着', 3, 100)
         + num('days', '按天保留几天', '更早的快照：24 小时内每小时留 1 份，之后每天留 1 份', 1, 60)
         + num('maxChats', '最多保留几个聊天', '超出后清掉最久没动的聊天（有锁定快照的不清）', 3, 200)

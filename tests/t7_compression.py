@@ -116,6 +116,7 @@ def main():
         C.ok(any(r['type'] == '补存' and '成功' in r['msg'] for r in lg) and L.floors(NAME) == n_disk + 1, 'G12 压缩保存失败后 3 秒补存成功', f'floors={L.floors(NAME)} hits={f.hits} passed={f.passed}')
         f.remove()
 
+        C.ok(not any(r['type'] == '压缩' for r in L.ca_log(pg)), 'G13 酒馆自己压过的请求体小锚不再压一遍（记录里没有「压缩」）')
         warns = [t for ty, t in con.lines if ty == 'warning' and '[小锚]' in t]
         C.ok(not warns, '小锚全程没有输出过警告', str(warns[:3]))
         b.close()
