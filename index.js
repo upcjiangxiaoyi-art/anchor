@@ -878,32 +878,31 @@ async function checkup() {
     const c = ctx();
     const msgs = c.chat;
     const enc = new TextEncoder();
+    const size = v => { const j = JSON.stringify(v); return j === undefined ? 0 : enc.encode(j).byteLength; }; // 精确字节数：中文 3 字节、英文 1 字节，不能用平均比例换算
     const fields = new Map();
     const heavy = [];
-    let chars = 0, bytes = 0;
+    let bytes = 0;
     let t0 = performance.now();
     for (let i = 0; i < msgs.length; i++) {
         const m = msgs[i];
-        const j = JSON.stringify(m) ?? 'null';
-        chars += j.length;
-        bytes += enc.encode(j).byteLength;
+        const total = size(m) || 4;
+        bytes += total;
         let topKey = '', topN = 0;
         if (m && typeof m === 'object') {
             for (const k of Object.keys(m)) {
                 const v = m[k];
                 if (k === 'extra' && v && typeof v === 'object') {
-                    for (const ek of Object.keys(v)) { const n = (JSON.stringify(v[ek]) ?? '').length; const key = 'extra.' + ek; fields.set(key, (fields.get(key) || 0) + n); if (n > topN) { topN = n; topKey = key; } }
-                } else { const n = (JSON.stringify(v) ?? '').length; fields.set(k, (fields.get(k) || 0) + n); if (n > topN) { topN = n; topKey = k; } }
+                    for (const ek of Object.keys(v)) { const n = size(v[ek]); const key = 'extra.' + ek; fields.set(key, (fields.get(key) || 0) + n); if (n > topN) { topN = n; topKey = key; } }
+                } else { const n = size(v); fields.set(k, (fields.get(k) || 0) + n); if (n > topN) { topN = n; topKey = k; } }
             }
         }
-        heavy.push({ index: i, chars: j.length, top: topKey, topChars: topN });
+        heavy.push({ index: i, bytes: total, top: topKey, topBytes: topN });
         if (performance.now() - t0 > 10) { await tick(); t0 = performance.now(); }
     }
-    const ratio = chars ? bytes / chars : 1; // 字符数换算成字节数（中文一个字 3 字节）
     const metaObj = c.chatMetadata ?? {};
     const metaJson = JSON.stringify(metaObj);
     const metaBytes = enc.encode(metaJson).byteLength;
-    const metaFields = Object.keys(metaObj).map(k => ({ key: k, bytes: Math.round((JSON.stringify(metaObj[k]) ?? '').length * ratio) })).sort((a, b) => b.bytes - a.bytes);
+    const metaFields = Object.keys(metaObj).map(k => ({ key: k, bytes: size(metaObj[k]) })).sort((a, b) => b.bytes - a.bytes);
     let gzBytes = null;
     if (bytes > 1048576 && typeof CompressionStream === 'function') { // 估一下压缩后多大（和「大聊天保存时压缩」发出去的大小一致）
         try {
@@ -915,13 +914,13 @@ async function checkup() {
             gzBytes = n;
         } catch { gzBytes = null; }
     }
-    heavy.sort((a, b) => b.chars - a.chars);
-    const list = [...fields].map(([key, n]) => ({ key, bytes: Math.round(n * ratio), own: ST_OWN.has(key) })).sort((a, b) => b.bytes - a.bytes);
+    heavy.sort((a, b) => b.bytes - a.bytes);
+    const list = [...fields].map(([key, n]) => ({ key, bytes: n, own: ST_OWN.has(key) })).sort((a, b) => b.bytes - a.bytes);
     const extBytes = list.filter(f => !f.own).reduce((a, f) => a + f.bytes, 0);
     return {
         chatName: info.chatName, owner: info.owner, count: msgs.length, bytes: bytes + metaBytes, gzBytes, extBytes,
         fields: list, meta: { bytes: metaBytes, fields: metaFields },
-        heavy: heavy.slice(0, 5).map(h => ({ index: h.index, bytes: Math.round(h.chars * ratio), top: h.top, topBytes: Math.round(h.topChars * ratio) })),
+        heavy: heavy.slice(0, 5).map(h => ({ index: h.index, bytes: h.bytes, top: h.top, topBytes: h.topBytes })),
     };
 }
 
