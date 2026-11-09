@@ -109,3 +109,9 @@
 .ca-slim-row { cursor: pointer; }
 .ca-slim-row input[type="checkbox"] { margin: 0 6px 0 0; vertical-align: middle; }
 .ca-slim-n { color: var(--ca-muted); font-size: .9em; font-variant-numeric: tabular-nums; }
+.ca-slim-tags { cursor: default; }
+.ca-slim-tags > label { display: flex; flex-direction: column; align-items: stretch; gap: 8px; cursor: pointer; }
+.ca-slim-tags > label > span:first-child { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.ca-slim-row span > b { display: flex; align-items: center; gap: 6px; }
+.ca-slim-tags > small { color: var(--ca-muted); font-size: .85em; line-height: 1.7; }
+.ca-chip { display: inline-block; padding: 0 8px; margin: 0 4px 2px 0; border: 1px solid var(--SmartThemeBorderColor, currentColor); border-radius: 10px; cursor: pointer; white-space: nowrap; }

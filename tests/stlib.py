@@ -101,6 +101,7 @@ def patch_settings(first_run=False, ext_enabled=True):
     if not ext_enabled:
         dis.append(EXT_ID)
     es['disabledExtensions'] = dis
+    es.pop('chat_anchor', None)  # 小锚自己的设置（忽略字段、瘦身标签名等）每个脚本都从默认值开始，上一轮跑剩的不能带进来
     SETTINGS.write_text(json.dumps(s, ensure_ascii=False), 'utf-8')
 
 

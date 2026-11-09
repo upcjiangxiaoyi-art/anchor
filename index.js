@@ -12,7 +12,7 @@
  */
 
 const EXT = 'chat_anchor';
-const VERSION = '1.2.10'; // 和 manifest.json 保持一致（测试会核对）
+const VERSION = '1.2.11'; // 和 manifest.json 保持一致（测试会核对）
 const TAG = '[小锚]';
 const DB_NAME = 'ST_ChatAnchor';
 const DB_VER = 1;
@@ -27,6 +27,7 @@ const DEFAULTS = Object.freeze({
     recent: 12,       // 最近 N 份无条件保留
     days: 7,          // 之后每天留 1 份，留几天
     maxChats: 30,     // 最多为多少个聊天保留快照
+    slimTags: '',     // 瘦身时清掉老楼正文里 <标签>…</标签> 整段的标签名，逗号分隔，如「灵魂梳理」
 });
 
 const ctx = () => globalThis.SillyTavern.getContext();
@@ -73,6 +74,7 @@ function settings() {
     const s = all[EXT];
     for (const k of Object.keys(DEFAULTS)) if (s[k] === undefined) s[k] = DEFAULTS[k];
     if (!Array.isArray(s.ignore)) s.ignore = []; // 判断"有没有变"时跳过的字段，如 extra.stImageAtelier、meta.variables
+    if (typeof s.slimTags !== 'string') s.slimTags = '';
     return s;
 }
 
@@ -905,6 +907,7 @@ async function checkup() {
     const size = v => { const j = JSON.stringify(v); return j === undefined ? 0 : enc.encode(j).byteLength; }; // 精确字节数：中文 3 字节、英文 1 字节，不能用平均比例换算
     const fields = new Map();
     const heavy = [];
+    const tagMap = new Map(); // 正文里 <标签>…</标签> 段落：名字 → 几楼、几段、多大
     let bytes = 0;
     let t0 = performance.now();
     for (let i = 0; i < msgs.length; i++) {
@@ -921,8 +924,21 @@ async function checkup() {
             }
         }
         heavy.push({ index: i, bytes: total, top: topKey, topBytes: topN });
+        if (typeof m?.mes === 'string' && m.mes.includes('</')) { // 先找有结尾的标签名，再按名字配对，免得 <br> 这类没结尾的标签让正则扫到底
+            const closers = new Set();
+            for (const x of m.mes.matchAll(CLOSE_TAG_RE)) closers.add(x[1]);
+            const re = tagRegex([...closers]);
+            const seen = new Set();
+            for (let x; re && (x = re.exec(m.mes));) {
+                const ts = tagMap.get(x[1]) || { name: x[1], floors: 0, count: 0, bytes: 0 };
+                ts.count++; ts.bytes += enc.encode(x[0]).byteLength;
+                if (!seen.has(x[1])) { seen.add(x[1]); ts.floors++; }
+                tagMap.set(x[1], ts);
+            }
+        }
         if (performance.now() - t0 > 10) { await tick(); t0 = performance.now(); }
     }
+    const tagStats = [...tagMap.values()].sort((a, b) => b.bytes - a.bytes).slice(0, 5);
     const metaObj = c.chatMetadata ?? {};
     const metaJson = JSON.stringify(metaObj);
     const metaBytes = enc.encode(metaJson).byteLength;
@@ -943,7 +959,7 @@ async function checkup() {
     const extBytes = list.filter(f => !f.own).reduce((a, f) => a + f.bytes, 0);
     return {
         chatName: info.chatName, owner: info.owner, count: msgs.length, bytes: bytes + metaBytes, gzBytes, extBytes,
-        fields: list, meta: { bytes: metaBytes, fields: metaFields },
+        fields: list, meta: { bytes: metaBytes, fields: metaFields }, tagStats,
         heavy: heavy.slice(0, 5).map(h => ({ index: h.index, bytes: h.bytes, top: h.top, topBytes: h.topBytes })),
     };
 }
@@ -954,6 +970,8 @@ function checkupText(d) {
     for (const f of d.fields.slice(0, 10)) lines.push(`  ${String(pct(f.bytes)).padStart(3)}%  ${fmtSize(f.bytes).padStart(8)}  ${fieldLabel(f.key)}`);
     if (d.meta.bytes > 10240) lines.push(`  ${String(pct(d.meta.bytes)).padStart(3)}%  ${fmtSize(d.meta.bytes).padStart(8)}  聊天设置（元数据）：${d.meta.fields.slice(0, 3).map(f => `${f.key} ${fmtSize(f.bytes)}`).join('，')}`);
     lines.push('最重的楼：' + d.heavy.map(h => `第 ${h.index + 1} 楼 ${fmtSize(h.bytes)}（${h.top}）`).join('、'));
+    const bigTags = (d.tagStats || []).filter(t => t.bytes >= 10240);
+    if (bigTags.length) lines.push('正文里的标签段落：' + bigTags.map(t => `<${t.name}> ${fmtSize(t.bytes)}（${t.floors} 楼）`).join('、') + '。瘦身里填上标签名，可以清掉老楼里的这些段落。');
     if (d.extBytes > d.bytes * 0.2) lines.push(`别的扩展写进楼里的数据占了 ${pct(d.extBytes)}%。让那个扩展把数据存到自己的文件里、楼里只留引用，文件就能瘦一大截。`);
     return lines.join('\n');
 }
@@ -967,6 +985,7 @@ async function showCheckup(d) {
         <p>${d.count} 楼，整份 <b>${fmtSize(d.bytes)}</b>${d.gzBytes ? `，压缩后约 <b>${fmtSize(d.gzBytes)}</b>` : ''}。酒馆每次保存都整份上传这么多。</p>
         <p><b>什么占地方</b></p><ol class="ca-check">${rows}</ol>
         <p><b>最重的楼</b>：${d.heavy.map(h => `第 ${h.index + 1} 楼 ${fmtSize(h.bytes)}（${esc(h.top)}）`).join('、')}</p>
+        ${(d.tagStats || []).some(t => t.bytes >= 10240) ? `<p><b>正文里的标签段落</b>：${d.tagStats.filter(t => t.bytes >= 10240).map(t => `&lt;${esc(t.name)}&gt; ${fmtSize(t.bytes)}（${t.floors} 楼）`).join('、')}<br><small>预设让模型写在正文里的思考过程之类。「瘦身…」里填上标签名，可以清掉老楼里的这些段落。</small></p>` : ''}
         <p class="ca-note">楼数不是问题，每楼的重量才是。${d.extBytes > d.bytes * 0.2 ? `别的扩展写进楼里的数据占了 ${pct(d.extBytes)}%：让那个扩展把数据存到自己的文件里、楼里只留引用，文件就能瘦一大截。` : '这个聊天大部分是正文本身，没什么可卸的包袱。'}</p></div>`;
     const res = await c.callGenericPopup(html, c.POPUP_TYPE.TEXT, '', { okButton: '关闭', cancelButton: false, allowVerticalScrolling: true, customButtons: [{ text: '复制报告', result: 2 }, { text: '瘦身…', result: 3 }] });
     if (res === 3) return showSlim(d);
@@ -982,17 +1001,43 @@ async function showCheckup(d) {
 // 和 mes 一模一样）连带 swipe_info，以及老楼的思维链。真正的备选回复默认不清。别的扩展写的 extra.* 一个字不碰。
 const SLIM_KEEP = 50;
 
+// 「标签段落」：很多预设让模型把思考过程写在正文里，用 <灵魂梳理>…</灵魂梳理> 这类自定义标签包起来。酒馆没把它们当思维链
+// （除非推理格式里正好设了这对前后缀），所以它们算正文，体检里也归在正文。瘦身可以按用户填的标签名把老楼里的整段去掉。
+/** 用户填的「灵魂梳理, <心流>」整理成标签名数组：去掉尖括号和斜杠，去重 */
+const parseTags = str => [...new Set(String(str || '').split(/[,，;；\s]+/).map(x => x.trim().replace(/^<\/?\s*|\s*\/?>$/g, '').trim()).filter(Boolean))];
+const escRe = x => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+/** 匹配 <标签 …>…</标签> 整段（跨行、非贪婪；缺结尾标签的不匹配），后面紧跟的一个换行一起算进去。第 1 组是标签名 */
+function tagRegex(tags) {
+    if (!tags?.length) return null;
+    return new RegExp(`<(${tags.map(escRe).join('|')})(?:\\s[^>]*)?>[\\s\\S]*?</\\1\\s*>\\n?`, 'g');
+}
+/** 去掉正文里的标签段。返回 { out, n }；没匹配到、或整楼只有这一段（去掉就空了）返回 null */
+function stripTagBlocks(str, re) {
+    if (typeof str !== 'string' || !re) return null;
+    re.lastIndex = 0;
+    const first = re.exec(str);
+    if (!first) return null;
+    re.lastIndex = 0;
+    let n = 0;
+    let out = str.replace(re, () => { n++; return ''; });
+    if (!str.slice(0, first.index).trim()) out = out.replace(/^\s+/, ''); // 段落在开头：把它留下的空行也去掉
+    return out.trim() ? { out, n } : null;
+}
+const CLOSE_TAG_RE = /<\/([A-Za-z\u4e00-\u9fff][\w\u4e00-\u9fff:-]*)\s*>/g;
+
 /** 只算不改：老楼里能卸掉什么、各多少字节。opts 里的 drop* 决定哪些算进 targets。 */
-async function slimPlan(msgs, { keepRecent = SLIM_KEEP, dropDup = true, dropReasoning = true, dropAlternates = false } = {}) {
+async function slimPlan(msgs, { keepRecent = SLIM_KEEP, dropDup = true, dropReasoning = true, dropAlternates = false, dropTags = false, tags = null } = {}) {
     const enc = new TextEncoder();
     const size = v => v === undefined ? 0 : enc.encode(JSON.stringify(v) ?? '').byteLength;
+    const names = Array.isArray(tags) ? parseTags(tags.join(',')) : parseTags(settings().slimTags);
+    const re = tagRegex(names);
     const end = Math.max(0, msgs.length - keepRecent);
-    const plan = { total: msgs.length, keepRecent, end, dup: { floors: 0, bytes: 0 }, alt: { floors: 0, bytes: 0, count: 0 }, reasoning: { floors: 0, bytes: 0 }, targets: [], bytes: 0 };
+    const plan = { total: msgs.length, keepRecent, end, dup: { floors: 0, bytes: 0 }, alt: { floors: 0, bytes: 0, count: 0 }, reasoning: { floors: 0, bytes: 0 }, tags: { names, floors: 0, count: 0, bytes: 0 }, targets: [], bytes: 0 };
     let t0 = performance.now();
     for (let i = 0; i < end; i++) {
         const m = msgs[i];
         if (!m || typeof m !== 'object') continue;
-        const t = { i, dup: false, alt: false, reasoning: false };
+        const t = { i, dup: false, alt: false, reasoning: false, tags: false };
         if (Array.isArray(m.swipes)) {
             if (m.swipes.length <= 1) { plan.dup.floors++; plan.dup.bytes += size(m.swipes) + size(m.swipe_info) + 24; t.dup = dropDup; }
             else { plan.alt.floors++; plan.alt.count += m.swipes.length - 1; plan.alt.bytes += size(m.swipes) + size(m.swipe_info) + 24; t.alt = dropAlternates; }
@@ -1000,20 +1045,27 @@ async function slimPlan(msgs, { keepRecent = SLIM_KEEP, dropDup = true, dropReas
         if (m.extra && typeof m.extra === 'object' && (m.extra.reasoning || m.extra.reasoning_duration != null)) {
             plan.reasoning.floors++; plan.reasoning.bytes += size(m.extra.reasoning) + size(m.extra.reasoning_duration) + size(m.extra.reasoning_type) + 40; t.reasoning = dropReasoning;
         }
-        if (t.dup || t.alt || t.reasoning) plan.targets.push(t);
+        if (re) {
+            let n = 0, b = 0;
+            const r = stripTagBlocks(m.mes, re);
+            if (r) { n += r.n; b += size(m.mes) - size(r.out); }
+            if (Array.isArray(m.swipes) && m.swipes.length > 1) for (const sw of m.swipes) { const rs = stripTagBlocks(sw, re); if (rs) { n += rs.n; b += size(sw) - size(rs.out); } } // 只有一份副本的 swipes 多半随「重复副本」一起删，不重复计
+            if (n) { plan.tags.floors++; plan.tags.count += n; plan.tags.bytes += b; t.tags = dropTags; }
+        }
+        if (t.dup || t.alt || t.reasoning || t.tags) plan.targets.push(t);
         if (performance.now() - t0 > 10) { await tick(); t0 = performance.now(); }
     }
-    plan.bytes = (dropDup ? plan.dup.bytes : 0) + (dropReasoning ? plan.reasoning.bytes : 0) + (dropAlternates ? plan.alt.bytes : 0);
+    plan.bytes = (dropDup ? plan.dup.bytes : 0) + (dropReasoning ? plan.reasoning.bytes : 0) + (dropAlternates ? plan.alt.bytes : 0) + (dropTags ? plan.tags.bytes : 0);
     return plan;
 }
 
 /** 真正动手。先存一份锁定的「瘦身前」快照，改内存里的楼，保存成功才重新读取。dryRun 只返回计划。 */
 async function slim(opts = {}) {
-    const { dryRun = false, keepRecent = SLIM_KEEP, dropDup = true, dropReasoning = true, dropAlternates = false } = opts;
+    const { dryRun = false, keepRecent = SLIM_KEEP, dropDup = true, dropReasoning = true, dropAlternates = false, dropTags = false, tags = null } = opts;
     const info = currentChat();
     if (!info) throw new Error('先打开一个聊天');
     if (!ctx().chat.length) throw new Error('聊天现在是空的，多半是还在重新读取。等它读完再瘦身');
-    const plan = await slimPlan(ctx().chat, { keepRecent, dropDup, dropReasoning, dropAlternates });
+    const plan = await slimPlan(ctx().chat, { keepRecent, dropDup, dropReasoning, dropAlternates, dropTags, tags });
     if (dryRun || !plan.targets.length) return { ...plan, applied: 0, saved: null };
     const p = S.poison.get(info.key);
     if (p && p.confirmed && !p.okSeen && !p.released) throw new Error('这个聊天还没读取成功，请先点「重新读取」');
@@ -1021,11 +1073,17 @@ async function slim(opts = {}) {
     if (currentChat()?.key !== info.key) throw new Error('聊天已经切换，已取消瘦身');
     const msgs = ctx().chat;
     if (msgs.length !== plan.total) throw new Error(msgs.length ? '聊天在这期间变了，已取消瘦身，请再点一次' : '聊天正在重新读取，等它读完再瘦身');
+    const re = tagRegex(plan.tags.names);
     for (const t of plan.targets) {
         const m = msgs[t.i];
         if (!m || typeof m !== 'object') continue;
         if (t.dup || t.alt) { delete m.swipes; delete m.swipe_info; delete m.swipe_id; }
         if (t.reasoning && m.extra) { delete m.extra.reasoning; delete m.extra.reasoning_duration; delete m.extra.reasoning_type; }
+        if (t.tags && re) {
+            const r = stripTagBlocks(m.mes, re);
+            if (r) m.mes = r.out;
+            if (Array.isArray(m.swipes)) m.swipes = m.swipes.map(sw => stripTagBlocks(sw, re)?.out ?? sw);
+        }
     }
     S.forceFull = true; // 老楼变了，下一次快照全量重算
     const t0 = Date.now();
@@ -1038,40 +1096,73 @@ async function slim(opts = {}) {
     if (dropDup && plan.dup.floors) parts.push(`重复 swipe 副本 ${plan.dup.floors} 楼`);
     if (dropReasoning && plan.reasoning.floors) parts.push(`思维链 ${plan.reasoning.floors} 楼`);
     if (dropAlternates && plan.alt.count) parts.push(`备选回复 ${plan.alt.count} 条`);
+    if (dropTags && plan.tags.floors) parts.push(`正文里的 ${plan.tags.names.map(x => `<${x}>`).join(' ')} 段落 ${plan.tags.floors} 楼`);
     logEvent('瘦身', `「${info.chatName}」清掉约 ${fmtSize(plan.bytes)}：${parts.join('、')}；最近 ${keepRecent} 楼没动${saved ? '' : '（服务器保存未确认）'}`);
     return { ...plan, applied: plan.targets.length, saved };
 }
 
 async function showSlim(d) {
     const c = ctx();
-    const plan = await slimPlan(ctx().chat, { keepRecent: SLIM_KEEP, dropDup: true, dropReasoning: true, dropAlternates: true });
+    const st = settings();
+    const all = { keepRecent: SLIM_KEEP, dropDup: true, dropReasoning: true, dropAlternates: true, dropTags: true };
+    const plan = await slimPlan(ctx().chat, { ...all, tags: parseTags(st.slimTags) });
     const total = d?.bytes || 0;
-    if (!plan.dup.floors && !plan.alt.floors && !plan.reasoning.floors) {
-        await c.callGenericPopup(`<div class="ca-dialog"><h3>没什么可清的</h3><p>最近 ${SLIM_KEEP} 楼不动，更早的楼里没有重复的 swipe 副本、备选回复或思维链。</p></div>`, c.POPUP_TYPE.TEXT, '', { okButton: '关闭' });
+    if (!plan.end) {
+        await c.callGenericPopup(`<div class="ca-dialog"><h3>还不用瘦身</h3><p>最近 ${SLIM_KEEP} 楼一律不动，这个聊天只有 ${plan.total} 楼，没有更早的楼可以处理。</p></div>`, c.POPUP_TYPE.TEXT, '', { okButton: '关闭' });
         return null;
     }
     const el = document.createElement('div');
     el.className = 'ca-dialog';
-    const row = (k, checked, title, note, bytes, floors) => `<label class="ca-row is-stack ca-slim-row"><span><b><input type="checkbox" data-slim="${k}" ${checked ? 'checked' : ''}> ${title}</b><small>${note}</small></span><span class="ca-slim-n">${fmtSize(bytes)} · ${floors} 楼</span></label>`;
+    const n = (bytes, floors) => `${fmtSize(bytes)} · ${floors} 楼`;
+    const row = (k, checked, title, note, bytes, floors) => `<label class="ca-row is-stack ca-slim-row"><span><b><input type="checkbox" data-slim="${k}" ${checked ? 'checked' : ''}> ${title}</b><small>${note}</small></span><span class="ca-slim-n" data-slim-n="${k}">${n(bytes, floors)}</span></label>`;
+    const chips = (d?.tagStats || []).filter(t => t.bytes >= 10240).slice(0, 5).map(t => `<span class="ca-chip" data-tag-chip="${esc(t.name)}">&lt;${esc(t.name)}&gt; ${fmtSize(t.bytes)}</span>`).join('');
     el.innerHTML = `<h3>「${esc(d?.chatName || '')}」瘦身</h3>
         <p>最近 ${SLIM_KEEP} 楼一律不动，只处理前 ${plan.end} 楼。别的扩展写进楼里的数据不碰。</p>
+        <p class="ca-note" data-slim-sum></p>
         ${row('dup', true, '重复的 swipe 副本', '酒馆给每条回复都多存了一份和正文一模一样的文本，去掉不丢任何内容。以后翻回去看老楼时，酒馆会给看到的那几楼重新补上，所以这项对平时不翻的老楼最有效', plan.dup.bytes, plan.dup.floors)}
         ${row('reasoning', true, '老楼的思维链', '模型的思考过程，不影响正文，老楼的没人回头看', plan.reasoning.bytes, plan.reasoning.floors)}
         ${row('alt', false, '老楼里没被选中的备选回复', `共 ${plan.alt.count} 条。清了就看不到那些备选了，默认不清`, plan.alt.bytes, plan.alt.floors)}
-        <p class="ca-note" data-slim-sum></p>
+        <div class="ca-row is-stack ca-slim-row ca-slim-tags"><label><span><b><input type="checkbox" data-slim="tags" ${plan.tags.floors ? 'checked' : ''}> 老楼正文里的「标签段落」</b><small>预设让模型写在正文里的思考过程，比如 &lt;灵魂梳理&gt;…&lt;/灵魂梳理&gt;。填标签名，多个用逗号分开。缺结尾标签的、整楼只有这一段的不动。<b>这项会改老楼正文</b>，清了就没了</small></span><span class="ca-slim-n" data-slim-n="tags">${n(plan.tags.bytes, plan.tags.floors)}</span></label>
+            <input type="text" class="text_pole" data-slim-tags value="${esc(st.slimTags || '')}" placeholder="标签名，例如：灵魂梳理">${chips ? `<small>体检在正文里看到的标签，点一下填进去：${chips}</small>` : ''}</div>
         <p class="ca-note">开始前会先存一份锁定快照「瘦身前」，后悔可以用它恢复。瘦身后会自动保存并重新读取。</p>`;
-    const picks = { dup: true, reasoning: true, alt: false };
+    const picks = { dup: true, reasoning: true, alt: false, tags: plan.tags.floors > 0 };
+    const input = el.querySelector('[data-slim-tags]');
     const sum = () => {
-        const b = (picks.dup ? plan.dup.bytes : 0) + (picks.reasoning ? plan.reasoning.bytes : 0) + (picks.alt ? plan.alt.bytes : 0);
+        const b = (picks.dup ? plan.dup.bytes : 0) + (picks.reasoning ? plan.reasoning.bytes : 0) + (picks.alt ? plan.alt.bytes : 0) + (picks.tags ? plan.tags.bytes : 0);
         el.querySelector('[data-slim-sum]').textContent = total ? `清完约 ${fmtSize(total)} → ${fmtSize(Math.max(0, total - b))}。` : `约可清掉 ${fmtSize(b)}。`;
     };
+    let timer = null, seq = 0;
+    const recount = () => { // 标签名一变就重新数一遍，几十 MB 的聊天也只要几十毫秒
+        clearTimeout(timer);
+        timer = setTimeout(async () => {
+            const my = ++seq;
+            const p2 = await slimPlan(ctx().chat, { ...all, tags: parseTags(input.value) });
+            if (my !== seq) return;
+            plan.tags = p2.tags;
+            el.querySelector('[data-slim-n="tags"]').textContent = n(plan.tags.bytes, plan.tags.floors);
+            el.querySelector('[data-slim="tags"]').checked = picks.tags = plan.tags.floors > 0;
+            sum();
+        }, 350);
+    };
     el.addEventListener('change', e => { const k = e.target?.dataset?.slim; if (k) { picks[k] = e.target.checked; sum(); } });
+    el.addEventListener('input', e => { if (e.target === input) recount(); });
+    el.addEventListener('click', e => {
+        const chip = e.target.closest('[data-tag-chip]');
+        if (!chip) return;
+        const cur = parseTags(input.value);
+        if (!cur.includes(chip.dataset.tagChip)) cur.push(chip.dataset.tagChip);
+        input.value = cur.join(', ');
+        recount();
+    });
     sum();
     const res = await c.callGenericPopup(el, c.POPUP_TYPE.CONFIRM, '', { okButton: '开始瘦身', cancelButton: '取消', allowVerticalScrolling: true });
-    if (res !== c.POPUP_RESULT.AFFIRMATIVE || (!picks.dup && !picks.reasoning && !picks.alt)) return null;
+    clearTimeout(timer);
+    const tags = parseTags(input.value);
+    if (tags.join(', ') !== (st.slimTags || '')) { st.slimTags = tags.join(', '); c.saveSettingsDebounced(); } // 填过的标签名记住，下次不用再填
+    if (res !== c.POPUP_RESULT.AFFIRMATIVE || (!picks.dup && !picks.reasoning && !picks.alt && !picks.tags)) return null;
     const done = toastHold('正在瘦身，大聊天要几秒…保存后会重新读取一遍，读完才算完成。');
     let r;
-    try { r = await slim({ dropDup: picks.dup, dropReasoning: picks.reasoning, dropAlternates: picks.alt }); } finally { done(); }
+    try { r = await slim({ dropDup: picks.dup, dropReasoning: picks.reasoning, dropAlternates: picks.alt, dropTags: picks.tags, tags }); } finally { done(); }
     toast(r.saved === false ? 'warning' : 'success', `瘦身完成，清掉约 ${fmtSize(r.bytes)}${r.saved === false ? '，但服务器保存未确认' : ''}。`);
     refreshPanel();
     return r;

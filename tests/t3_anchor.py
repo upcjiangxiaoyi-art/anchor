@@ -438,6 +438,48 @@ def main():
             await window.__caReload; out.after = ctx.chat.length; return out;''')
         C.ok(r4['len'] == 0 and '空的' in r4['checkup'] and '空的' in r4['slim'] and r4['after'] == n_all, 'M13 聊天正在重读（暂时 0 楼）时，体检和瘦身都拒绝并说明原因，读完后楼数完整', str(r4))
         L.unslow_fetch(pg, '/api/chats/get')
+        # ---- 标签段落（1.2.11）：预设让模型把思考写在正文里，如 <灵魂梳理>…</灵魂梳理>。酒馆不当它是思维链，瘦身按标签名清老楼里的
+        blk = '<灵魂梳理>\n' + '先想想她为什么这么说。' * 160 + '\n</灵魂梳理>\n'  # 每段约 5 KB：体检只列 10 KB 以上的标签段落
+        orig = L.ev(pg, '''const blk = arg; const orig = [ctx.chat[3].mes, ctx.chat[60].mes];
+            for (const i of [3, 4, 60, 105]) ctx.chat[i].mes = blk + ctx.chat[i].mes;
+            ctx.chat[105].swipes = [ctx.chat[105].mes, blk + '备选二']; ctx.chat[105].swipe_id = 0;
+            ctx.chat[5].mes = '<灵魂梳理>没写完的 ' + ctx.chat[5].mes;
+            ctx.chat[ctx.chat.length - 1].mes = blk + ctx.chat[ctx.chat.length - 1].mes;
+            await ctx.saveChat(); return orig;''', blk)
+        time.sleep(0.5)
+        d = pg.evaluate('async () => await ChatAnchor.checkup()')
+        ts = next((x for x in d.get('tagStats', []) if x['name'] == '灵魂梳理'), None)
+        C.ok(ts and ts['floors'] == 5 and ts['count'] == 5 and ts['bytes'] > 200, 'M14 体检认出正文里的 <灵魂梳理> 段落有 5 楼（含最近楼，不含没写完的）', str(d.get('tagStats')))
+        plan = pg.evaluate('async () => await ChatAnchor.slim({ dryRun: true, tags: ["灵魂梳理"] })')
+        C.ok(plan['tags']['floors'] == 4 and plan['tags']['count'] == 6 and plan['tags']['bytes'] > 200 and plan['applied'] == 0, 'M15 只算不改：老楼里 4 楼有标签段落（没写完的、最近 50 楼的不算），备选里的两段也算', str(plan['tags']))
+        pg.evaluate('() => ChatAnchor.open("cur")')
+        pg.wait_for_selector('.ca-panel [data-act="checkup"]')
+        pg.click('.ca-panel [data-act="checkup"]')
+        pg.wait_for_selector('dialog[open] .ca-check', timeout=15000)
+        C.ok('灵魂梳理' in L.dialog_text(pg), 'M16 体检弹窗里列出了 <灵魂梳理> 段落有多大')
+        L.click_dialog_button(pg, '瘦身')
+        pg.wait_for_selector('dialog[open] input[data-slim-tags]', timeout=15000)
+        C.ok(pg.input_value('dialog[open] input[data-slim-tags]') == '' and not pg.is_checked('dialog[open] input[data-slim="tags"]'), 'M17 还没填标签名时，标签段落一项是空的、不勾')
+        pg.click('dialog[open] [data-tag-chip="灵魂梳理"]')
+        pg.wait_for_function('() => /4 楼/.test(document.querySelector("dialog[open] [data-slim-n=tags]").textContent)', timeout=5000)
+        C.ok(pg.input_value('dialog[open] input[data-slim-tags]') == '灵魂梳理' and pg.is_checked('dialog[open] input[data-slim="tags"]'), 'M18 点体检看到的标签就填进输入框，数出 4 楼并自动勾上', pg.input_value('dialog[open] input[data-slim-tags]'))
+        pg.uncheck('dialog[open] input[data-slim="dup"]')
+        pg.uncheck('dialog[open] input[data-slim="reasoning"]')
+        pg.screenshot(path=str(OUT / 't3_slim_tags.png'))
+        L.click_dialog_button(pg, '开始瘦身')
+        for _ in range(80):
+            rows = L.read_chat(cur_name)
+            if rows and '灵魂梳理' not in rows[1 + 3]['mes']:
+                break
+            time.sleep(0.5)
+        L.wait_js(pg, f'ctx.chat.length === {n_all}', timeout=30000)
+        time.sleep(1)
+        rows = L.read_chat(cur_name)
+        C.ok(rows[1 + 3]['mes'] == orig[0] and rows[1 + 60]['mes'] == orig[1] and '灵魂梳理' not in rows[1 + 105]['mes'] and rows[1 + 105]['swipes'] == [rows[1 + 105]['mes'], '备选二'], 'M19 老楼正文和备选里的 <灵魂梳理> 段落都清掉了，正文其余部分一字不差', repr(rows[1 + 3]['mes'][:60]))
+        C.ok(rows[1 + 5]['mes'].startswith('<灵魂梳理>没写完的 ') and rows[-1]['mes'].startswith('<灵魂梳理>'), 'M20 没写完的段落和最近 50 楼的一字不动')
+        saved_tags = L.ev(pg, 'return ctx.extensionSettings.chat_anchor.slimTags')
+        C.ok(saved_tags == '灵魂梳理' and any(x['type'] == '瘦身' and '<灵魂梳理>' in x['msg'] for x in L.ca_log(pg)), 'M21 标签名记住了，记录里写了清掉哪种段落', str(saved_tags) + ' ' + str([x['msg'][:80] for x in L.ca_log(pg) if x['type'] == '瘦身'][-1:]))
+        close_panel(pg)
         pg.evaluate('() => ChatAnchor.open("cur")')
         pg.wait_for_selector('.ca-panel [data-act="checkup"]')
         pg.click('.ca-panel [data-act="checkup"]')
@@ -446,6 +488,7 @@ def main():
         pg.wait_for_selector('dialog[open] input[data-slim="dup"]', timeout=15000)
         txt = L.dialog_text(pg)
         C.ok('重复的 swipe 副本' in txt and '老楼的思维链' in txt and '清完约' in txt and pg.is_checked('dialog[open] input[data-slim="dup"]') and pg.is_checked('dialog[open] input[data-slim="reasoning"]') and not pg.is_checked('dialog[open] input[data-slim="alt"]'), 'M12 体检弹窗 → 瘦身对话框：三项都在，副本/思维链默认勾、备选默认不勾', txt.replace(chr(10), ' ')[:200])
+        C.ok(pg.input_value('dialog[open] input[data-slim-tags]') == '灵魂梳理' and not pg.is_checked('dialog[open] input[data-slim="tags"]'), 'M22 再打开时标签名还在，但老楼里已经没有可清的，所以不勾')
         pg.screenshot(path=str(OUT / 't3_slim.png'))
         L.click_dialog_button(pg, '取消')
         time.sleep(0.4)
