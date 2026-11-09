@@ -12,7 +12,7 @@
  */
 
 const EXT = 'chat_anchor';
-const VERSION = '1.2.9'; // 和 manifest.json 保持一致（测试会核对）
+const VERSION = '1.2.10'; // 和 manifest.json 保持一致（测试会核对）
 const TAG = '[小锚]';
 const DB_NAME = 'ST_ChatAnchor';
 const DB_VER = 1;
@@ -35,6 +35,12 @@ const tick = () => new Promise(r => setTimeout(r, 0));
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const esc = s => String(s ?? '').replace(/[&<>"']/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', '\'': '&#39;' }[m]));
 const toast = (kind, msg, opts = {}) => { try { globalThis.toastr?.[kind]?.(msg, '小锚', opts); } catch { /* 没有 toastr 也不影响功能 */ } };
+/** 一直显示的提示，返回一个函数，调用它关掉这条提示 */
+const toastHold = msg => {
+    let el = null;
+    try { el = globalThis.toastr?.info?.(msg, '小锚', { timeOut: 0, extendedTimeOut: 0, tapToDismiss: false }); } catch { /* 同上 */ }
+    return () => { try { if (el) globalThis.toastr?.clear?.(el); } catch { /* 同上 */ } };
+};
 
 const S = {
     queue: Promise.resolve(),              // 所有写库操作排队执行
@@ -660,6 +666,21 @@ async function waitFor(fn, ms = 10000) {
     return false;
 }
 
+/**
+ * 等酒馆把聊天真正读回来。酒馆的 reloadCurrentChat 外面有互斥锁：已经有一次重读在进行时它会立刻返回，
+ * 不能当作"读完了"——否则用户会在聊天还是空的那几秒里看到 0 楼。
+ */
+async function waitReloaded(key, expectCount, ms = 120000) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < ms) {
+        if (currentChat()?.key !== key) return false; // 用户切走了，不用等了
+        const n = ctx().chat.length;
+        if (n > 0 && (expectCount == null || n === expectCount)) return true;
+        await sleep(200);
+    }
+    return ctx().chat.length > 0;
+}
+
 async function getSnap(id) {
     const snap = await dbGet('snaps', id);
     if (!snap) throw new Error('这份快照已经不存在了');
@@ -745,6 +766,7 @@ async function restoreInPlace(id) {
     await takeSnapshot('pre-restore', { force: true, lock: true });
     const c = ctx();
     if (currentChat()?.key !== info.key) throw new Error('聊天已经切换，已取消恢复');
+    if (!c.chat.length) throw new Error('聊天正在重新读取，等它读完再恢复');
     const integrity = c.chatMetadata?.integrity; // 沿用当前文件的校验码，否则酒馆会拒绝保存
     c.chat.splice(0, c.chat.length, ...msgs);
     c.updateChatMetadata({ ...meta, ...(integrity ? { integrity } : {}) }, true);
@@ -755,6 +777,7 @@ async function restoreInPlace(id) {
     const saved = !!(ls && ls.ok && ls.at >= t0);
     if (saved) {
         await ctx().reloadCurrentChat();
+        await waitReloaded(info.key, msgs.length);
     } else {
         const c2 = ctx();
         if (typeof c2.clearChat === 'function' && typeof c2.printMessages === 'function') { await c2.clearChat(); await c2.printMessages(); }
@@ -877,6 +900,7 @@ async function checkup() {
     if (!info) throw new Error('先打开一个聊天');
     const c = ctx();
     const msgs = c.chat;
+    if (!msgs.length) throw new Error('聊天现在是空的，多半是还在重新读取。等它读完再体检');
     const enc = new TextEncoder();
     const size = v => { const j = JSON.stringify(v); return j === undefined ? 0 : enc.encode(j).byteLength; }; // 精确字节数：中文 3 字节、英文 1 字节，不能用平均比例换算
     const fields = new Map();
@@ -988,6 +1012,7 @@ async function slim(opts = {}) {
     const { dryRun = false, keepRecent = SLIM_KEEP, dropDup = true, dropReasoning = true, dropAlternates = false } = opts;
     const info = currentChat();
     if (!info) throw new Error('先打开一个聊天');
+    if (!ctx().chat.length) throw new Error('聊天现在是空的，多半是还在重新读取。等它读完再瘦身');
     const plan = await slimPlan(ctx().chat, { keepRecent, dropDup, dropReasoning, dropAlternates });
     if (dryRun || !plan.targets.length) return { ...plan, applied: 0, saved: null };
     const p = S.poison.get(info.key);
@@ -995,6 +1020,7 @@ async function slim(opts = {}) {
     await takeSnapshot('pre-slim', { force: true, lock: true });
     if (currentChat()?.key !== info.key) throw new Error('聊天已经切换，已取消瘦身');
     const msgs = ctx().chat;
+    if (msgs.length !== plan.total) throw new Error(msgs.length ? '聊天在这期间变了，已取消瘦身，请再点一次' : '聊天正在重新读取，等它读完再瘦身');
     for (const t of plan.targets) {
         const m = msgs[t.i];
         if (!m || typeof m !== 'object') continue;
@@ -1006,7 +1032,7 @@ async function slim(opts = {}) {
     await ctx().saveChat();
     const ls = S.lastSave.get(info.key);
     const saved = !!(ls && ls.ok && ls.at >= t0);
-    if (saved) await ctx().reloadCurrentChat();
+    if (saved) { await ctx().reloadCurrentChat(); await waitReloaded(info.key, plan.total); }
     else toast('warning', '瘦身后的内容还没成功存到服务器。先别刷新，等自动补存成功的提示。', { timeOut: 10000 });
     const parts = [];
     if (dropDup && plan.dup.floors) parts.push(`重复 swipe 副本 ${plan.dup.floors} 楼`);
@@ -1043,8 +1069,9 @@ async function showSlim(d) {
     sum();
     const res = await c.callGenericPopup(el, c.POPUP_TYPE.CONFIRM, '', { okButton: '开始瘦身', cancelButton: '取消', allowVerticalScrolling: true });
     if (res !== c.POPUP_RESULT.AFFIRMATIVE || (!picks.dup && !picks.reasoning && !picks.alt)) return null;
-    toast('info', '正在瘦身，大聊天要几秒…', { timeOut: 4000 });
-    const r = await slim({ dropDup: picks.dup, dropReasoning: picks.reasoning, dropAlternates: picks.alt });
+    const done = toastHold('正在瘦身，大聊天要几秒…保存后会重新读取一遍，读完才算完成。');
+    let r;
+    try { r = await slim({ dropDup: picks.dup, dropReasoning: picks.reasoning, dropAlternates: picks.alt }); } finally { done(); }
     toast(r.saved === false ? 'warning' : 'success', `瘦身完成，清掉约 ${fmtSize(r.bytes)}${r.saved === false ? '，但服务器保存未确认' : ''}。`);
     refreshPanel();
     return r;

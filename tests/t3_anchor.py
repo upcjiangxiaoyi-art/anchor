@@ -424,6 +424,20 @@ def main():
         time.sleep(1)
         rows = L.read_chat(cur_name)
         C.ok(saved is True and rows[1 + 5].get('swipes') == [rows[1 + 5]['mes']] and rows[1 + 5]['extra'].get('reasoning') == '想了想 5' and len(rows[1 + 105]['swipes']) == 2, 'M9 用「瘦身前」快照恢复，副本、思维链、备选全回来')
+        # 酒馆的 reloadCurrentChat 有互斥锁，正在重读时立刻返回；slim 必须等聊天真正读回来才算完
+        L.slow_fetch(pg, '/api/chats/get', 2500)
+        L.ev(pg, 'for (let i = 0; i < 20; i++) { const m = ctx.chat[i]; m.swipe_id = 0; m.swipes = [m.mes]; } await ctx.saveChat();')
+        time.sleep(0.5)
+        r3 = L.ev(pg, 'const r = await ChatAnchor.slim({}); return [r.applied, ctx.chat.length];')
+        C.ok(r3[0] >= 20 and r3[1] == n_all, 'M11 重新读取很慢时，slim 也要等聊天读回来才返回（返回时楼数完整）', str(r3))
+        # 用户实际遇到的：瘦身后酒馆还在重读、聊天暂时是空的，这时点体检看到「0 楼 325 KB」。现在体检和瘦身都要拒绝并说明原因
+        r4 = L.ev(pg, '''window.__caReload = ctx.reloadCurrentChat(); await new Promise(r => setTimeout(r, 300));
+            const out = { len: ctx.chat.length };
+            try { await ChatAnchor.checkup(); out.checkup = 'no-throw'; } catch (e) { out.checkup = e.message; }
+            try { await ChatAnchor.slim({}); out.slim = 'no-throw'; } catch (e) { out.slim = e.message; }
+            await window.__caReload; out.after = ctx.chat.length; return out;''')
+        C.ok(r4['len'] == 0 and '空的' in r4['checkup'] and '空的' in r4['slim'] and r4['after'] == n_all, 'M13 聊天正在重读（暂时 0 楼）时，体检和瘦身都拒绝并说明原因，读完后楼数完整', str(r4))
+        L.unslow_fetch(pg, '/api/chats/get')
         pg.evaluate('() => ChatAnchor.open("cur")')
         pg.wait_for_selector('.ca-panel [data-act="checkup"]')
         pg.click('.ca-panel [data-act="checkup"]')
@@ -431,7 +445,7 @@ def main():
         L.click_dialog_button(pg, '瘦身')
         pg.wait_for_selector('dialog[open] input[data-slim="dup"]', timeout=15000)
         txt = L.dialog_text(pg)
-        C.ok('重复的 swipe 副本' in txt and '老楼的思维链' in txt and '清完约' in txt and pg.is_checked('dialog[open] input[data-slim="dup"]') and pg.is_checked('dialog[open] input[data-slim="reasoning"]') and not pg.is_checked('dialog[open] input[data-slim="alt"]'), 'M10 体检弹窗 → 瘦身对话框：三项都在，副本/思维链默认勾、备选默认不勾', txt.replace(chr(10), ' ')[:200])
+        C.ok('重复的 swipe 副本' in txt and '老楼的思维链' in txt and '清完约' in txt and pg.is_checked('dialog[open] input[data-slim="dup"]') and pg.is_checked('dialog[open] input[data-slim="reasoning"]') and not pg.is_checked('dialog[open] input[data-slim="alt"]'), 'M12 体检弹窗 → 瘦身对话框：三项都在，副本/思维链默认勾、备选默认不勾', txt.replace(chr(10), ' ')[:200])
         pg.screenshot(path=str(OUT / 't3_slim.png'))
         L.click_dialog_button(pg, '取消')
         time.sleep(0.4)

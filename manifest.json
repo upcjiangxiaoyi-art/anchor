@@ -6,7 +6,7 @@
     "js": "index.js",
     "css": "style.css",
     "author": "江 & Claude (Anthropic)",
-    "version": "1.2.9",
+    "version": "1.2.10",
     "homePage": "",
     "auto_update": false
 }

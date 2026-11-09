@@ -64,13 +64,15 @@ v1.2.5 起是**增量**的（用户的主聊天 48 MiB，每次全量 stringify 
 
 **瘦身**（v1.2.9）：用户真实的 55 MB 聊天体检结果——正文 15.5 MB，`swipes` 也是 15.5 MB（和正文一样大：酒馆给每条 AI 回复都存 `swipes: [mes]`，基本不是备选而是副本），`stImageAtelier` 12.8 MB，`swipe_info` 2.9、`reasoning` 2.7、`ipe_inject_*` 4.7 MB。`slimPlan()` 只看最近 `SLIM_KEEP`（50）楼以前的楼：`swipes.length <= 1` 算"重复副本"（连 `swipe_info`、`swipe_id` 一起删）。**酒馆渲染每条 AI 回复时 `updateSwipeCounter`/`isMessageSwipeable` 会调 `ensureSwipes` 把 `swipes: [mes]` 补回来**（默认渲染最近 100 楼，往上翻会渲染更多），所以副本只对没被渲染到的老楼真正瘦下去，翻过的楼会随下次保存写回——对话框和 README 里都写明了；这也是为什么测试里第二次 slim 只清备选，`extra.reasoning/reasoning_duration/reasoning_type` 算思维链，`swipes.length > 1` 算备选（默认不清）。别的扩展的 `extra.*` 不碰。`slim()`：先 `takeSnapshot('pre-slim', { force, lock })`，改内存对象，`S.forceFull = true`，`saveChat()`（走小锚的压缩），保存确认成功才 `reloadCurrentChat()`。入口在体检弹窗的「瘦身…」按钮，对话框里三个勾选框实时算清完多大。
 
+**v1.2.10 的「0 楼」**：用户瘦身后点体检，报告写「0 楼 325 KB」（325 KB 是元数据），再点一次就正常。原因：酒馆 `reloadCurrentChat` = `reloadChatMutex.update`，`SimpleMutex.update` 在已经有一次重读进行中时**立刻返回**，所以 `await reloadCurrentChat()` 不是"读完了"的信号；而且就算正常走完，手机上重读几十 MB 要好几秒，这期间 `chat` 是空的，用户完全可能在这时点体检。改法：`waitReloaded(key, expectCount)` 轮询 `ctx().chat.length` 回到预期楼数（上限 120 秒，用户切走聊天就退出），`slim` / `restoreInPlace` 重读后都等它；`checkup` / `slim` 在空聊天上直接抛「聊天现在是空的，多半是还在重新读取」；`slim` 改内存前核对 `msgs.length === plan.total`；瘦身进行中的提示用 `toastHold()` 挂到结束。t3 的 M11（`/api/chats/get` 慢 2.5 秒，slim 返回时楼数要完整）和 M13（重读进行中 0 楼时体检/瘦身要拒绝）测这个。
+
 **补存**：保存请求失败 → 记录状态码和响应体 → 3 / 8 / 20 秒后调 `ctx.saveChat()`。integrity 错误不重试，酒馆自己会弹窗。
 
 **大请求体自动压缩**（v1.2.7）：2026-11-08 用户的保存全部 413——上个月改的 nginx 500m 被重置回 50m（1Panel 会重写 nginx.conf），聊天刚过 50 MiB。酒馆自己的 `compressRequest` 只压 `minPayloadSize`（256kb）到 `maxPayloadSize`（**默认 8mb**）之间的请求体，且 worker 3 秒超时，所以几十 MB 的聊天一直裸着发。服务器端是 `bodyParser.json({ limit: '500mb' })`，`inflate` 默认开，无条件接受 `Content-Encoding: gzip`。于是守门的保存分支改走 `sendSave()`：请求体是字符串（酒馆没压过）且超过 `S.gzipAbove`（4 MiB）就用 `CompressionStream('gzip')` 压一遍再发，头里加 `Content-Encoding: gzip`（`classify` 在压缩前已经从字符串里拿到了文件名）；服务器回 400/415 且不是 integrity 错误 → 置 `S.gzipBroken`，原样重发一次，之后不再压；任何异常都原样发。设置 `gzipSaves` 默认开。本机 43.3 MB 的测试聊天：压到 4.7 MB，压缩 + 本地上传共 1.5 秒（测试文本重复度高，真实聊天估计压到 15–25%）。注意「恢复成新聊天」走 multipart 的 `/api/chats/import`，压不了，大聊天在反代限制没放开前只能用「覆盖当前聊天」。
 
 **恢复**
 - 新聊天：`/api/chats/import`（multipart，文件字段名必须是 `avatar`），再 `openCharacterChat`
-- 覆盖当前：先存一份锁定的"恢复前"快照 → `chat.splice` → `updateChatMetadata(meta, true)` 并沿用当前 integrity → `ctx.saveChat()` → 确认保存成功才 `reloadCurrentChat()`
+- 覆盖当前：先存一份锁定的"恢复前"快照 → `chat.splice` → `updateChatMetadata(meta, true)` 并沿用当前 integrity → `ctx.saveChat()` → 确认保存成功才 `reloadCurrentChat()`，再 `waitReloaded()` 等楼数真正回来（见「瘦身」一段末尾）
 
 **服务器备份**（v1.2.0，「服务器」页）：`/api/backups/chat/get` 列出、`/api/backups/chat/download` 下载，再走 `importToCharacter()`。文件名 `chat_<key>_<YYYYMMDD-HHMMSS>.jsonl`，`backupKeyOf()` 复刻了服务器的 `getBackupKey`（非 ASCII 名字带 sha256 前 8 位），用来把备份对回角色卡。SHA-256 是纯 JS 实现，因为云酒馆常用 http，浏览器不给 `crypto.subtle`。文件名里的时间是服务器本地时间，只用来排序和原样显示。
 
@@ -112,7 +114,7 @@ ST_DIR=~/st KEEP_ST=1 tests/run.sh t5
 
 - `stlib.py`：公共库。iPhone 视口 390×844 + 触摸；`Fault` 用 Playwright 路由让某个接口断网 / 返回指定状态码（回调里不能 sleep，会卡住同步 API）；`slow_fetch` 在页面里给 fetch 加延迟模拟慢服务器；磁盘聊天文件读写；`Checks` 计数。
 - `t1_rootcause.py`：不装小锚复现根因，两条路径（断网 reload / 502 openCharacterChat），10 项。
-- `t3_anchor.py`：A 自动快照，B 去重和跳过，C 断网读取失败，D 502 读取失败，I 第三方读取失败不误拦（含 21 秒等标记作废），E 保存失败补存，F 掉楼检测和覆盖恢复，G 恢复成新聊天，H 面板（含「改了什么」标签、弹窗、忽略字段），J 增量重算，K 大请求体自动压缩，L 体检，M 瘦身，96 项。
+- `t3_anchor.py`：A 自动快照，B 去重和跳过，C 断网读取失败，D 502 读取失败，I 第三方读取失败不误拦（含 21 秒等标记作废），E 保存失败补存，F 掉楼检测和覆盖恢复，G 恢复成新聊天，H 面板（含「改了什么」标签、弹窗、忽略字段），J 增量重算，K 大请求体自动压缩，L 体检，M 瘦身（含 M11/M13 重读慢、重读中 0 楼），98 项。
 - `t4_legacy.py`：旧插件备份救援，8 项。
 - `t5_server.py`：服务器备份页。前 7 项是 1.2.0 的（中文文件名角色卡 `韩川央.png` 自动复制、跑完删掉），然后是 1.2.1 的慢服务器不卡面板 / 只发一个请求，1.2.2 的刷新页面后直接用记住的列表 / 504 给处理办法，最后是超时提示保留旧列表，21 项。
 - `t6_group.py`：群聊根因复现 + 守门（断网、502 两条路径）+ 掉楼 + 两种恢复，33 项，约 3 分钟。用户说群聊优先级低，但代码已经验证过能跑。
