@@ -2,7 +2,9 @@
 t3_anchor.py — 装上小锚后的端到端检查（iPhone 视口 390×844）。
 
 A 自动快照   B 去重和跳过   C 断网读取失败   D 502 读取失败   I 第三方读取失败不误拦
-E 保存失败补存   F 掉楼检测和覆盖恢复   G 恢复成新聊天   H 面板
+E 保存失败补存（含一直存不上时的横幅、慢速补存）   N 读取期间的空保存   O 读取返回 200 但内容是空的 / 没读完
+F 掉楼检测和覆盖恢复   G 恢复成新聊天
+H 面板   J 增量重算   K 大请求体压缩   L 体检   M 瘦身（含标签段落预览、一步瘦身）
 """
 import sys
 import time
@@ -174,6 +176,157 @@ def main():
         tx = toasts(pg)
         C.ok(any('没能存到服务器' in t or '补存' in t for t in tx), 'E6 弹了「没能存到服务器 / 已补存」的提示', str(tx))
         f.remove()
+
+        # 一直存不上（1.2.12）。413 这类要人处理的：快速重试用完就不再自动试，挂一条不消失的提示，面板顶部有横幅说人话
+        pg.evaluate('() => { ChatAnchor.state.retryQuick = [400, 400, 400]; ChatAnchor.state.retrySlow = [1500]; toastr.remove(); }')
+        n_disk = L.floors(NAME)
+        f = L.Fault(pg, '**/api/chats/save', mode=413, body='<html><body><h1>413 Request Entity Too Large</h1></body></html>')
+        slash(pg, '/send 这条一直存不上')
+        L.wait_js(pg, 'ChatAnchor.state.lastSave.get(arg)?.fails >= 4', timeout=20000, arg=key)
+        get_ls = '(k) => { const x = ChatAnchor.state.lastSave.get(k); return { ok: x.ok, status: x.status, fails: x.fails, since: x.since }; }'
+        ls1 = pg.evaluate(get_ls, key)
+        pg.wait_for_timeout(3000)  # 不能用 time.sleep：路由回调只在 Playwright 调用期间执行
+        ls = pg.evaluate(get_ls, key)
+        C.ok(ls['ok'] is False and ls['status'] == 413 and ls['fails'] == ls1['fails'] == f.hits >= 4 and ls['since'] > 0, 'E7 413 存不上：快速重试用完就不再自动重试（试多少次都一样），记下了从几点起、试了几次', f'{ls1} -> {ls} hits={f.hits}')
+        tx = toasts(pg)
+        C.ok(any('一直没能存到服务器' in t and '反代' in t for t in tx), 'E8 快速重试用完后挂出一条不消失的提示，原因是大白话', str(tx))
+        pg.evaluate('() => ChatAnchor.open("log")')
+        pg.wait_for_selector('.ca-panel [data-save-banner]')
+        bt = pg.inner_text('.ca-panel [data-save-banner]')
+        C.ok('没能存到服务器' in bt and 'HTTP 413' in bt and '体检' in bt and f"试了 {ls['fails']} 次" in bt and '现在再存一次' in bt and '没有丢' in bt, 'E9 面板顶部（哪一页都有）挂着横幅：从几点起、试了几次、原因、怎么办', bt.replace(chr(10), ' ')[:220])
+        pg.evaluate('() => { document.getElementById("toast-container").style.visibility = "hidden"; }')
+        pg.screenshot(path=str(OUT / 't3_save_banner.png'))
+        pg.evaluate('() => { document.getElementById("toast-container").style.visibility = ""; }')
+        f.remove()
+        pg.evaluate('() => document.querySelector(".ca-panel [data-act=save-now]").click()')
+        L.wait_js(pg, 'ChatAnchor.state.lastSave.get(arg)?.ok === true', timeout=15000, arg=key)
+        pg.wait_for_function('() => !document.querySelector(".ca-panel [data-save-banner]") && ![...document.querySelectorAll("#toast-container .toast")].some(t => t.innerText.includes("一直没能存到服务器"))', timeout=8000)
+        lg = L.ca_log(pg)
+        C.ok(L.floors(NAME) == n_disk + 1 and any(r['type'] == '补存' and f"之前 {ls['fails']} 次没存上" in r['msg'] for r in lg), 'E10 点「现在再存一次」存上后：横幅和那条提示自动消失，记录里写了之前几次没存上', str([r['msg'] for r in lg if r['type'] == '补存'][-2:]))
+        close_panel(pg)
+
+        # 临时故障（502）：快速重试用完后隔一会儿再试，每次先探路；服务器没回来就不上传，回来了自动补存
+        pg.evaluate('() => toastr.remove()')
+        n_disk = L.floors(NAME)
+        f = L.Fault(pg, '**/api/chats/save', mode=502)
+        fp = L.Fault(pg, '**/csrf-token', mode=502)
+        slash(pg, '/send 服务器暂时没响应')
+        L.wait_js(pg, 'ChatAnchor.state.lastSave.get(arg)?.fails >= 4', timeout=20000, arg=key)
+        pg.wait_for_timeout(500)
+        hits0 = f.hits
+        pg.wait_for_timeout(4500)
+        C.ok(f.hits == hits0 and fp.hits >= 2, 'E11 服务器没回来时只探路，不把整份聊天白传一遍', f'save {hits0} -> {f.hits}，探路 {fp.hits} 次')
+        fp.remove()
+        f.remove()
+        L.wait_js(pg, 'ChatAnchor.state.lastSave.get(arg)?.ok === true', timeout=15000, arg=key)
+        time.sleep(0.5)
+        lg = L.ca_log(pg)
+        C.ok(L.floors(NAME) == n_disk + 1 and any(r['type'] == '补存' and '之后隔几分钟再试' in r['msg'] for r in lg), 'E12 服务器恢复后不用任何操作，自动补存成功', str([r['msg'] for r in lg if r['type'] == '补存'][-2:]))
+        n_disk = L.floors(NAME)
+        f = L.Fault(pg, '**/api/chats/save', mode=413)
+        slash(pg, '/send 断网回来以后要马上补上')
+        L.wait_js(pg, 'ChatAnchor.state.lastSave.get(arg)?.fails >= 4', timeout=20000, arg=key)
+        pg.wait_for_timeout(1500)
+        f.remove()
+        hits_before = pg.evaluate('(k) => ChatAnchor.state.lastSave.get(k).fails', key)
+        pg.evaluate('() => window.dispatchEvent(new Event("online"))')
+        L.wait_js(pg, 'ChatAnchor.state.lastSave.get(arg)?.ok === true', timeout=15000, arg=key)
+        time.sleep(0.5)
+        C.ok(L.floors(NAME) == n_disk + 1 and hits_before >= 4, 'E14 网络恢复（online 事件）时不等下一轮，马上补存', f'floors={L.floors(NAME)} want={n_disk + 1}')
+        pg.evaluate('() => { ChatAnchor.state.retryQuick = [3000, 8000, 20000]; ChatAnchor.state.retrySlow = [60000, 120000, 300000]; toastr.remove(); }')
+        ex = pg.evaluate('''() => Object.fromEntries([[0, '网络错误 Failed to fetch'], [401, 'HTTP 401'], [403, 'HTTP 403 Invalid CSRF token. Please refresh the page and try again.'], [500, 'HTTP 500 x'], [504, 'HTTP 504 x'], [400, 'HTTP 400 {"error":"integrity"}']]
+            .map(([status, detail]) => [status, ChatAnchor.explainSave({ status, detail })]))''')
+        C.ok('连不上服务器' in ex['0']['why'] and '重新登录' in ex['401']['why'] and ex['403'].get('refresh') is True and '刷新' in ex['403']['todo'] and '磁盘' in ex['500']['why'] and '没有响应' in ex['504']['why'] and '别的设备' in ex['400']['why'],
+             'E13 断网、要重新登录、凭证失效、服务器出错、没响应、被别处改过：各有各的大白话', str({k: v['why'][:14] for k, v in ex.items()}))
+
+        # ───────── N 读取期间的空保存（1.2.12） ─────────
+        C.section('N 聊天正在读取时不许存')
+        n_disk = L.floors(NAME)
+        hold = L.Hold(pg, '**/api/chats/get')
+        pg.evaluate('() => { window.__caReload = SillyTavern.getContext().reloadCurrentChat(); }')
+        for _ in range(60):
+            if hold.held:
+                break
+            pg.wait_for_timeout(100)
+        st0 = L.ev(pg, 'return [ctx.chat.length, ChatAnchor.state.loading.get(arg) || 0, ChatAnchor.canSaveNow(arg)]', key)
+        L.ev(pg, 'await ctx.saveChat(); return true')
+        time.sleep(0.5)
+        lg = L.ca_log(pg)
+        C.ok(st0[:2] == [0, 1] and L.floors(NAME) == n_disk and any(r['type'] == '守门' and '正在读取' in r['msg'] for r in lg), 'N1 聊天正在读取、内存里还是空的时候有人调保存：拦下，磁盘上的存档原样', f'st={st0} floors={L.floors(NAME)} want={n_disk}')
+        C.ok(st0[2] is False, 'N2 这种时候小锚自己的补存也不会发起')
+        hold.remove()
+        pg.evaluate('async () => { await window.__caReload; }')
+        L.wait_js(pg, f'ctx.chat.length === {n_disk}', timeout=15000)
+        time.sleep(1.5)
+        L.ev(pg, 'await ctx.saveChat(); return true')
+        time.sleep(0.5)
+        st1 = L.ev(pg, 'return [ChatAnchor.state.lastSave.get(arg)?.ok, ChatAnchor.state.loading.size, ChatAnchor.canSaveNow(arg)]', key)
+        C.ok(st1 == [True, 0, True] and L.floors(NAME) == n_disk, 'N3 读完以后保存恢复正常，读取计数清零', str(st1))
+        pg.evaluate('() => toastr.remove()')
+
+        # ───────── O 读取「成功」了，内容却是空的或不完整（1.2.12） ─────────
+        # 酒馆服务器读文件时出任何异常都返回 200 + 空对象；手机上几十 MB 的响应体也可能下到一半断掉。
+        # 这两种酒馆都当成"空聊天"，塞进开场白存回去（t1 的场景 3、4）。原来的守门只看请求失败和非 2xx，拦不住。
+        C.section('O 读取返回 200，但内容是空的 / 没读完')
+
+        def gutted_load(body):
+            n0 = L.floors(NAME)
+            mark = pg.evaluate('() => Date.now()')
+            flt = L.Fault(pg, '**/api/chats/get', mode=200, body=body)
+            L.ev(pg, 'ctx.reloadCurrentChat().catch(() => {});')
+            shown = True
+            try:
+                pg.wait_for_function(LOAD_FAIL_DIALOG, timeout=20000)
+            except Exception:
+                shown = False
+            pg.wait_for_timeout(2000)
+            flt.remove()
+            return n0, shown, [r for r in L.ca_log(pg) if r['ts'] >= mark], L.dialog_text(pg)
+
+        n0, shown, lg, dt = gutted_load('{}')
+        C.ok(shown and L.floors(NAME) == n0 and any(r['type'] == '读取失败' and '内容是空的' in r['msg'] for r in lg) and any(r['type'] == '守门' and '拦下' in r['msg'] for r in lg),
+             'O1 服务器返回 200 + 空对象：当作读取失败，开场白没能盖掉存档', f'shown={shown} floors={L.floors(NAME)} want={n0} log={[r["msg"][:50] for r in lg]}')
+        C.ok('没有读出来' in dt and f'小锚上次存的是 {n0} 楼' in dt and '解除暂停' in dt and '在别的设备上清空过' in dt, 'O2 弹窗说清楚了：读出来是空的、小锚记得有几楼、真清空过该怎么办', dt.replace(chr(10), ' ')[:240])
+        pg.screenshot(path=str(OUT / 't3_load_empty.png'))
+        L.click_dialog_button(pg, '重新读取')
+        L.wait_js(pg, f'ctx.chat.length === {n0}', timeout=20000)
+        time.sleep(1)
+        C.ok(L.chat_len(pg) == n0 and L.poison(pg, key) is None, f'O3 重新读取后回到 {n0} 楼，暂停解除')
+
+        n0, shown, lg, dt = gutted_load('[{"chat_metadata":{}},{"name":"Seraphina","is_user":false,"mes":"下到一半就断')
+        C.ok(shown and L.floors(NAME) == n0 and any(r['type'] == '读取失败' and '内容没读完' in r['msg'] for r in lg), 'O4 内容下到一半断了（JSON 不完整）：同样当作读取失败，存档原样', f'shown={shown} floors={L.floors(NAME)} log={[r["msg"][:60] for r in lg]}')
+        L.click_dialog_button(pg, '重新读取')
+        L.wait_js(pg, f'ctx.chat.length === {n0}', timeout=20000)
+        time.sleep(1)
+        slash(pg, '/send 读回来以后照常保存')
+        L.wait_snaps(pg, lambda s_: s_ and s_[0]['count'] == n0 + 1)
+        time.sleep(0.5)
+        C.ok(L.poison(pg, key) is None and L.floors(NAME) == n0 + 1, 'O5 重新读取成功后保存恢复正常，磁盘 +1 楼', f'floors={L.floors(NAME)}')
+
+        # 不能误伤：真的是新聊天（小锚没见过）照常建；用户自己把楼删光以后再读取，也不算读取失败
+        mark = pg.evaluate('() => Date.now()')
+        fresh = 'anchor-fresh-chat'
+        L.ev(pg, 'await ctx.openCharacterChat(arg);', fresh)
+        L.wait_js(pg, 'ctx.chatId === arg && ctx.chat.length === 1', arg=fresh, timeout=20000)
+        pg.wait_for_timeout(1500)
+        lg = [r for r in L.ca_log(pg) if r['ts'] >= mark]
+        C.ok(L.floors(fresh) == 1 and not any(r['type'] in ('读取失败', '守门') for r in lg) and not pg.evaluate(LOAD_FAIL_DIALOG), 'O6 小锚没见过的新聊天：服务器返回空是正常的，开场白照常存下去', f'floors={L.floors(fresh)} log={[r["msg"][:40] for r in lg]}')
+        slash(pg, '/send 第一句')
+        slash(pg, '/send 第二句')
+        L.wait_snaps(pg, lambda s_: s_ and s_[0]['count'] == 3)
+        slash(pg, '/cut 0-2')
+        L.wait_js(pg, 'ctx.chat.length === 0', timeout=10000)
+        pg.wait_for_timeout(2500)
+        mark = pg.evaluate('() => Date.now()')
+        L.ev(pg, 'await ctx.reloadCurrentChat();')
+        L.wait_js(pg, 'ctx.chat.length === 1', timeout=20000)
+        pg.wait_for_timeout(1500)
+        lg = [r for r in L.ca_log(pg) if r['ts'] >= mark]
+        C.ok(L.floors(fresh) == 1 and not any(r['type'] in ('读取失败', '守门', '掉楼') for r in lg) and not pg.evaluate(LOAD_FAIL_DIALOG), 'O7 用户自己把楼删光以后再读取：不算读取失败，也不误报掉楼', f'floors={L.floors(fresh)} log={[r["type"] + ":" + r["msg"][:40] for r in lg]}')
+        L.open_chat(pg, NAME)
+        L.wait_js(pg, f'ctx.chat.length === {n0 + 1}', timeout=20000)
+        time.sleep(1.5)
+        pg.evaluate('() => toastr.remove()')
 
         # ───────── F 掉楼检测和覆盖恢复 ─────────
         C.section('F 掉楼检测和覆盖恢复')
@@ -395,12 +548,27 @@ def main():
             await ctx.saveChat();''')
         time.sleep(0.5)
         # 前面的测试步骤（/sendas、恢复等）已经给一些楼留了 swipes，所以期望值按页面里实际的数来
-        exp = L.ev(pg, '''const end = ctx.chat.length - 50; const old = ctx.chat.slice(0, end);
-            return { dup: old.filter(m => Array.isArray(m.swipes) && m.swipes.length <= 1).length, alt: old.filter(m => Array.isArray(m.swipes) && m.swipes.length > 1).length,
-                     reasoning: old.filter(m => m.extra && (m.extra.reasoning || m.extra.reasoning_duration != null)).length,
-                     targets: old.filter(m => (Array.isArray(m.swipes) && m.swipes.length <= 1) || (m.extra && (m.extra.reasoning || m.extra.reasoning_duration != null))).length };''')
+        # 酒馆读取聊天后会给它显示出来的那些楼（默认最近 100 楼）重新补上副本，所以副本只算、只清更早的楼（from 以前）
+        exp = L.ev(pg, '''const n = ctx.chat.length, end = n - 50, tr = ctx.powerUserSettings.chat_truncation, from = Math.min(end, tr > 0 ? Math.max(0, n - tr) : 0);
+            const old = ctx.chat.slice(0, end), single = m => Array.isArray(m.swipes) && m.swipes.length <= 1, rs = m => m.extra && (m.extra.reasoning || m.extra.reasoning_duration != null);
+            return { from, dup: old.filter((m, i) => single(m) && i < from).length, skipped: old.filter((m, i) => single(m) && i >= from).length, alt: old.filter(m => Array.isArray(m.swipes) && m.swipes.length > 1).length,
+                     reasoning: old.filter(rs).length, targets: old.filter((m, i) => (single(m) && i < from) || rs(m)).length };''')
         plan = pg.evaluate('async () => await ChatAnchor.slim({ dryRun: true })')
         C.ok(plan['dup']['floors'] == exp['dup'] >= 100 and plan['alt']['floors'] == exp['alt'] == 11 and plan['alt']['count'] == 11 and plan['reasoning']['floors'] == exp['reasoning'] == 50 and plan['applied'] == 0, 'M1 只算不改：副本、备选、思维链各几楼都数对，最后一楼不在范围内', str({k: plan[k] for k in ('dup', 'alt', 'reasoning', 'end')}) + ' exp=' + str(exp))
+        C.ok(plan['shown'] == exp['from'] > 0 and plan['dup']['skipped'] == exp['skipped'] > 0, 'M1b 酒馆显示出来的那些楼（它会自己把副本补回去）不算进副本、也不去动', f"shown={plan['shown']} skipped={plan['dup']['skipped']} exp={exp}")
+        pg.evaluate('() => { ChatAnchor.state.slimHintMin = 1; ChatAnchor.state.slimHint = null; ChatAnchor.open("cur"); }')
+        pg.wait_for_selector('.ca-panel [data-act="slim-quick"]', timeout=10000)
+        ht = pg.inner_text('.ca-panel [data-slim-hint]')
+        C.ok('可以清' in ht and f"重复的 swipe 副本 {exp['dup']} 楼" in ht and '思维链 50 楼' in ht and '瘦身…' in ht and '按上次' not in ht, 'M10 「当前」页直接写出老楼里攒了多少可清；还没用过瘦身时按钮是「瘦身…」', ht.replace(chr(10), ' '))
+        pg.screenshot(path=str(OUT / 't3_slim_hint.png'))
+        pg.evaluate('() => { toastr.remove(); document.querySelector(".ca-panel [data-act=slim-quick]").click(); }')
+        pg.wait_for_selector('dialog[open] input[data-slim-tags]', timeout=15000)
+        txt = L.dialog_text(pg)
+        C.ok('瘦身' in txt and '一共约可清掉' in txt and pg.is_checked('dialog[open] input[data-slim="dup"]') and pg.is_checked('dialog[open] input[data-slim="reasoning"]') and not pg.is_checked('dialog[open] input[data-slim="alt"]'),
+             'M10b 点「瘦身…」不用先体检，直接开瘦身对话框：副本、思维链默认勾，备选默认不勾', txt.replace(chr(10), ' ')[:160])
+        L.click_dialog_button(pg, '取消')
+        time.sleep(0.5)
+        close_panel(pg)
         before = L.floors(cur_name)
         r = pg.evaluate('async () => await ChatAnchor.slim({})')
         L.wait_js(pg, f'ctx.chat.length === {n_all}', timeout=30000)
@@ -466,7 +634,20 @@ def main():
         pg.uncheck('dialog[open] input[data-slim="dup"]')
         pg.uncheck('dialog[open] input[data-slim="reasoning"]')
         pg.screenshot(path=str(OUT / 't3_slim_tags.png'))
+        has_preview = '() => [...document.querySelectorAll("dialog[open]")].some(d => d.innerText.includes("先看一眼要删的是什么"))'
         L.click_dialog_button(pg, '开始瘦身')
+        pg.wait_for_function(has_preview, timeout=10000)
+        pv = L.dialog_text(pg)
+        C.ok('<灵魂梳理>' in pv and '先想想她为什么这么说' in pv and '第 106 楼会删掉这一段' in pv and '删完以后，第 106 楼的正文剩下' in pv and '像是正文本身' not in pv, 'M23 清正文之前先给看：哪个标签、几楼、举一楼的真实例子、那一楼删完剩下什么', pv.replace(chr(10), ' ')[-260:])
+        pg.screenshot(path=str(OUT / 't3_slim_preview.png'))
+        L.click_dialog_button(pg, '返回')
+        pg.wait_for_function('() => ![...document.querySelectorAll("dialog[open]")].some(d => d.innerText.includes("先看一眼要删的是什么")) && !!document.querySelector("dialog[open] input[data-slim-tags]")', timeout=10000)
+        time.sleep(0.4)
+        C.ok(L.floors(cur_name) == n_all and '灵魂梳理' in L.read_chat(cur_name)[1 + 3]['mes'] and pg.input_value('dialog[open] input[data-slim-tags]') == '灵魂梳理' and pg.is_checked('dialog[open] input[data-slim="tags"]') and not pg.is_checked('dialog[open] input[data-slim="dup"]'),
+             'M24 点「返回」什么都没删，回到瘦身对话框，刚才填的和勾的都还在')
+        L.click_dialog_button(pg, '开始瘦身')
+        pg.wait_for_function(has_preview, timeout=10000)
+        L.click_dialog_button(pg, '就删这些')
         for _ in range(80):
             rows = L.read_chat(cur_name)
             if rows and '灵魂梳理' not in rows[1 + 3]['mes']:
@@ -479,20 +660,91 @@ def main():
         C.ok(rows[1 + 5]['mes'].startswith('<灵魂梳理>没写完的 ') and rows[-1]['mes'].startswith('<灵魂梳理>'), 'M20 没写完的段落和最近 50 楼的一字不动')
         saved_tags = L.ev(pg, 'return ctx.extensionSettings.chat_anchor.slimTags')
         C.ok(saved_tags == '灵魂梳理' and any(x['type'] == '瘦身' and '<灵魂梳理>' in x['msg'] for x in L.ca_log(pg)), 'M21 标签名记住了，记录里写了清掉哪种段落', str(saved_tags) + ' ' + str([x['msg'][:80] for x in L.ca_log(pg) if x['type'] == '瘦身'][-1:]))
+        last = L.ev(pg, 'return ctx.extensionSettings.chat_anchor.slimLast')
+        C.ok(last == {'dup': False, 'reasoning': False, 'alt': False, 'tags': '灵魂梳理'}, 'M25 这次确认并做完的选项记了下来，留给「按上次的选项瘦身」', str(last))
         close_panel(pg)
-        pg.evaluate('() => ChatAnchor.open("cur")')
+
+        # ---- 一步瘦身（1.2.12）：「当前」页按上次的选项算出可清多少，一个按钮、只确认一次
+        L.ev(pg, 'const blk = arg; for (const i of [10, 11]) ctx.chat[i].mes = blk + ctx.chat[i].mes; await ctx.saveChat();', blk)
+        time.sleep(0.5)
+        pg.evaluate('() => { toastr.remove(); ChatAnchor.state.slimHint = null; ChatAnchor.open("cur"); }')
+        pg.wait_for_selector('.ca-panel [data-act="slim-quick"]', timeout=10000)
+        ht = pg.inner_text('.ca-panel [data-slim-hint]')
+        C.ok('<灵魂梳理> 段落 2 楼' in ht and '按上次的选项瘦身' in ht and '副本' not in ht, 'M29 用过瘦身以后，提示按上次的选项算，按钮变成「按上次的选项瘦身」', ht.replace(chr(10), ' '))
+        pg.evaluate('() => document.querySelector(".ca-panel [data-act=slim-quick]").click()')
+        pg.wait_for_function('() => [...document.querySelectorAll("dialog[open]")].some(d => d.querySelector("h3")?.innerText === "按上次的选项瘦身")', timeout=10000)
+        qt = L.dialog_text(pg)
+        C.ok('<灵魂梳理> 段落 2 楼' in qt and '先想想她为什么这么说' in qt and '第 12 楼会删掉这一段' in qt and '改选项' in qt, 'M30 一步瘦身只确认一次，确认框里同样给看要删的例子，也能改选项', qt.replace(chr(10), ' ')[-260:])
+        pg.screenshot(path=str(OUT / 't3_slim_quick.png'))
+        L.click_dialog_button(pg, '改选项')
+        pg.wait_for_selector('dialog[open] input[data-slim-tags]', timeout=15000)
+        C.ok(pg.input_value('dialog[open] input[data-slim-tags]') == '灵魂梳理' and pg.is_checked('dialog[open] input[data-slim="tags"]') and L.floors(cur_name) == n_all and '灵魂梳理' in L.read_chat(cur_name)[1 + 10]['mes'],
+             'M30b 点「改选项…」什么都没删，打开完整的瘦身对话框，上次的标签名和勾选都带过来')
+        L.click_dialog_button(pg, '取消')
+        time.sleep(0.6)
+        pg.evaluate('() => { toastr.remove(); document.querySelector(".ca-panel [data-act=slim-quick]").click(); }')
+        pg.wait_for_function('() => [...document.querySelectorAll("dialog[open]")].some(d => d.querySelector("h3")?.innerText === "按上次的选项瘦身")', timeout=10000)
+        L.click_dialog_button(pg, '开始瘦身')
+        for _ in range(80):
+            rows = L.read_chat(cur_name)
+            if rows and '灵魂梳理' not in rows[1 + 10]['mes']:
+                break
+            time.sleep(0.5)
+        L.wait_js(pg, f'ctx.chat.length === {n_all}', timeout=30000)
+        pg.wait_for_function('() => !!document.querySelector(".ca-panel [data-slim-hint]") && !document.querySelector(".ca-panel [data-act=slim-quick]")', timeout=10000)
+        rows = L.read_chat(cur_name)
+        last2 = L.ev(pg, 'return ctx.extensionSettings.chat_anchor.slimLast')
+        C.ok('灵魂梳理' not in rows[1 + 10]['mes'] and '灵魂梳理' not in rows[1 + 11]['mes'] and rows[1 + 5]['mes'].startswith('<灵魂梳理>没写完的 ') and last2 == last, 'M31 清完了，老楼里没有可清的，提示自动消失；记住的选项没变', str(last2))
+        close_panel(pg)
+
+        pg.evaluate('() => { toastr.remove(); ChatAnchor.open("cur"); }')
         pg.wait_for_selector('.ca-panel [data-act="checkup"]')
         pg.click('.ca-panel [data-act="checkup"]')
         pg.wait_for_selector('dialog[open] .ca-check', timeout=15000)
         L.click_dialog_button(pg, '瘦身')
         pg.wait_for_selector('dialog[open] input[data-slim="dup"]', timeout=15000)
         txt = L.dialog_text(pg)
-        C.ok('重复的 swipe 副本' in txt and '老楼的思维链' in txt and '清完约' in txt and pg.is_checked('dialog[open] input[data-slim="dup"]') and pg.is_checked('dialog[open] input[data-slim="reasoning"]') and not pg.is_checked('dialog[open] input[data-slim="alt"]'), 'M12 体检弹窗 → 瘦身对话框：三项都在，副本/思维链默认勾、备选默认不勾', txt.replace(chr(10), ' ')[:200])
-        C.ok(pg.input_value('dialog[open] input[data-slim-tags]') == '灵魂梳理' and not pg.is_checked('dialog[open] input[data-slim="tags"]'), 'M22 再打开时标签名还在，但老楼里已经没有可清的，所以不勾')
+        C.ok('重复的 swipe 副本' in txt and '老楼的思维链' in txt and '勾选的几项里现在没有可清的' in txt and not pg.is_checked('dialog[open] input[data-slim="dup"]') and not pg.is_checked('dialog[open] input[data-slim="reasoning"]') and not pg.is_checked('dialog[open] input[data-slim="alt"]'),
+             'M12 体检弹窗 → 瘦身对话框：几项都在，勾选沿用上次确认过的；勾的几项没东西可清就直说', txt.replace(chr(10), ' ')[:200])
+        C.ok(pg.input_value('dialog[open] input[data-slim-tags]') == '灵魂梳理' and not pg.is_checked('dialog[open] input[data-slim="tags"]') and '没有可清的' in pg.inner_text('dialog[open] [data-slim-n="tags"]'), 'M22 再打开时标签名还在，但老楼里已经没有可清的，所以不勾')
+        pg.check('dialog[open] input[data-slim="alt"]')
+        pg.wait_for_function('() => document.querySelector("dialog[open] [data-slim-sum]").textContent.includes("清完约")', timeout=5000)
+        C.ok(True, 'M26 勾上有东西可清的一项，合计马上变成「清完约 … → …」')
+        pg.uncheck('dialog[open] input[data-slim="alt"]')
         pg.screenshot(path=str(OUT / 't3_slim.png'))
         L.click_dialog_button(pg, '取消')
         time.sleep(0.4)
         close_panel(pg)
+
+        # ---- 故事正文那一段（<content>）不做成可点的按钮；真手填了，预览里红字提醒；取消以后不留
+        L.ev(pg, '''const story = '她抬起头，看着窗外的雨。'.repeat(150), draw = 'masterpiece, 1girl, rain, window, '.repeat(160);
+            for (const i of [20, 21, 22]) ctx.chat[i].mes = '<content>' + story + '</content>\\n<draw>' + draw + '</draw>';
+            await ctx.saveChat();''')
+        time.sleep(0.5)
+        pg.evaluate('() => { toastr.remove(); ChatAnchor.open("cur"); }')
+        pg.wait_for_selector('.ca-panel [data-act="checkup"]')
+        pg.click('.ca-panel [data-act="checkup"]')
+        pg.wait_for_selector('dialog[open] .ca-check', timeout=15000)
+        ck = L.dialog_text(pg)
+        L.click_dialog_button(pg, '瘦身')
+        pg.wait_for_selector('dialog[open] input[data-slim-tags]', timeout=15000)
+        chips = pg.evaluate('() => [...document.querySelectorAll("dialog[open] [data-tag-chip]")].map(x => x.dataset.tagChip)')
+        C.ok('<content>' in ck and '<draw>' in ck and '故事本身那一段不要填' in ck and 'draw' in chips and 'content' not in chips, 'M27 体检照实列出 <content> 和 <draw>，但瘦身里只把 <draw> 做成可点的按钮，并提醒故事本身别填', f'chips={chips}')
+        pg.fill('dialog[open] input[data-slim-tags]', 'content')
+        pg.wait_for_function('() => /3 楼/.test(document.querySelector("dialog[open] [data-slim-n=tags]").textContent)', timeout=5000)
+        L.click_dialog_button(pg, '开始瘦身')
+        pg.wait_for_function(has_preview, timeout=10000)
+        pv = L.dialog_text(pg)
+        C.ok('看名字像是正文本身' in pv and '她抬起头，看着窗外的雨' in pv and 'masterpiece' in pv, 'M28 硬要填 content：预览里红字提醒，还能亲眼看到要删的是故事、剩下的是画图指令', pv.replace(chr(10), ' ')[-300:])
+        pg.screenshot(path=str(OUT / 't3_slim_content.png'))
+        L.click_dialog_button(pg, '返回')
+        pg.wait_for_function('() => ![...document.querySelectorAll("dialog[open]")].some(d => d.innerText.includes("先看一眼要删的是什么")) && !!document.querySelector("dialog[open] input[data-slim-tags]")', timeout=10000)
+        time.sleep(0.4)
+        L.click_dialog_button(pg, '取消')
+        time.sleep(0.6)
+        close_panel(pg)
+        kept = L.ev(pg, 'return [ctx.extensionSettings.chat_anchor.slimTags, ctx.chat[20].mes.startsWith("<content>")]')
+        C.ok(kept == ['灵魂梳理', True], 'M32 反悔取消以后正文没动，填过的 content 也不会留到下次', str(kept))
 
         warns = [t for ty, t in con.lines if ty == 'warning' and '[小锚]' in t]
         C.ok(not warns, '小锚全程没有输出过警告', str(warns[:3]))

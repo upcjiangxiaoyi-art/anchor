@@ -324,6 +324,40 @@ class Fault:
             pass
 
 
+class Hold:
+    """把匹配的请求按住不放（请求已经从页面发出、过了小锚的 fetch 包装，但还没到服务器），调 release() 才放行。
+    用来造「聊天正在读取」的那几秒。回调里只是把 route 存起来，不 sleep。"""
+
+    def __init__(self, page, url_glob):
+        self.page = page
+        self.url_glob = url_glob
+        self.held = []
+        self.armed = True
+        page.route(url_glob, self._handle)
+
+    def _handle(self, route, request):
+        if self.armed:
+            self.held.append(route)
+        else:
+            route.continue_()
+
+    def release(self):
+        self.armed = False
+        for r in self.held:
+            try:
+                r.continue_()
+            except Exception:
+                pass
+        self.held = []
+
+    def remove(self):
+        self.release()
+        try:
+            self.page.unroute(self.url_glob, self._handle)
+        except Exception:
+            pass
+
+
 class Spy:
     """只记录不拦截：数一数某个接口被请求了几次，存下请求体。"""
 

@@ -55,6 +55,14 @@ The integrity check does not help:
 
 Group chats have the same problem for non‑2xx responses: `loadGroupChat()` in `public/scripts/group-chats.js` returns `[]` when `!response.ok`, and `getGroupChat()` then treats it as a fresh chat (`freshChat = true`), pushes the members' greetings and calls `saveGroupChat()`. (For a *network* error the group path throws instead, which leaves the chat empty on screen but does not save.)
 
+### The same thing happens when the request "succeeds" (HTTP 200)
+Two more ways to reach the same overwrite, both reproduced on 1.19.0 (scenarios 3 and 4 in the test script below):
+
+1. **The server answers 200 with `{}`.** `/api/chats/get` in `src/endpoints/chats.js` wraps everything in `try { ... } catch (error) { console.error(error); return response.send({}); }`, and `getChatData()` returns `[]` when the file cannot be read. So any server-side exception while reading the chat (I/O error, out of memory on a large file, ...) is reported to the client as a successful empty chat. The client then takes the "An empty/corrupted chat file" branch, clears `chat`, calls `getChatResult()`, pushes the greeting and saves it over the real file.
+2. **The response body is cut off.** With chat files of tens of MB on a mobile connection the body can fail after the headers arrived. `response.json()` rejects, control goes to the same `catch`, and the greeting is saved over the real file.
+
+In both cases the request looks fine in the network tab, which makes this very hard to diagnose for users.
+
 ### Steps to reproduce
 1. Open a character chat with a few hundred messages. Note the message count and the file on disk.
 2. Make the next `/api/chats/get` fail. Any of these work:
@@ -83,6 +91,8 @@ Do not fall through to `getChatResult()` on failure, or at least do not save the
     return;   // no saveChatConditional()
 }
 ```
+
+On the server, `/api/chats/get` should answer with a 5xx status when reading the file throws, instead of `200 {}`, so the client can tell "this chat does not exist yet" from "this chat could not be read".
 
 and in `getGroupChat()` distinguish "file is empty/new" from "request failed" (e.g. have `loadGroupChat()` throw on `!response.ok` and handle it the same way) so that `saveGroupChat()` is only called for a genuinely new chat.
 

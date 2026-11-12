@@ -12,6 +12,10 @@ SillyTavern 第三方扩展，防丢楼。v1.0–1.2.0 在 claude.ai 里写完�
 - 从 `reloadCurrentChatUnsafe` 进来时 `chat_metadata` 没重置，带着有效的旧 integrity，校验照样通过。所以不能用"有没有 integrity"判断是否处于坏状态。
 - 群聊同理：`group-chats.js` 的 `loadGroupChat` 遇到非 2xx 返回 `[]`，`getGroupChat` 当成新聊天并 `saveGroupChat`。
 - 群聊遇到**网络错误**（fetch 抛异常）则不同：`loadGroupChat` 没有 try/catch，`getGroupChat` 整个中断，不保存、不发 `CHAT_CHANGED`，屏幕留空（0 楼）。这时用户再发一句话就会把空聊天存回去盖掉原文件。
+- **读取请求"成功"（HTTP 200）也会走到同一个结局**（2026-11-12 发现并复现，t1 的场景 3、4）：
+  - 服务器 `src/endpoints/chats.js` 的 `/api/chats/get` 整个包在 `try { … } catch (error) { return response.send({}) }` 里，`getChatData()` 读不到文件返回 `[]`。也就是服务器读文件时出任何异常，客户端收到的都是 200 + 空对象；`getChat()` 把非数组当成「空的或损坏的聊天文件」，清空 `chat` 后同样进 `getChatResult()`。
+  - 响应体下到一半断了、或 JSON 不完整：`response.json()` 抛错，进 catch。手机上几十 MB 的响应体很容易这样，切后台时系统掐掉连接也是这条路。
+  - 这两种在 1.2.11 及以前的小锚上**拦不住**（守门只看 fetch 失败和非 2xx），只能靠事后的掉楼检测和快照救。实验：120 楼的聊天、装着 1.2.11，两种情况磁盘都是 120 → 1 楼。1.2.12 补上了（守门第 7 条）。
 
 **截图里的 400**（`The request's body.chat is not an array.`）
 旧插件的恢复请求在原版 1.19 上返回 200。只有请求体到达服务器时是空的才会出这句。谁弄丢了请求体，未知。酒馆自己的保存走同一个接口，如果也被这样弄丢会同样失败，这点是猜测，没证实。
@@ -53,6 +57,11 @@ v1.2.5 起是**增量**的（用户的主聊天 48 MiB，每次全量 stringify 
 4. 该聊天再次读取成功 + 下一次 `CHAT_CHANGED` → 清除
 5. 20 秒没等到 `CHAT_CHANGED` → 标记作废（说明是别的插件在读，不是酒馆）
 6. 例外：读取失败 1 秒后如果当前聊天就是这个 key 且 `chat.length === 0`，直接确认并弹窗（针对上面群聊网络错误那条；别的插件读取失败不会把屏幕清空，不会误伤）
+7. **读取要盯到响应体读完**（v1.2.12，`trackLoad`）：给读取响应的 `json()` / `text()` 套一层，只看不改，酒馆照常读。`json()` 抛错 → 读取失败（「内容没读完」）；读出来一楼都没有（角色聊天数组第一行是文件头，所以看 `length - 1`；非数组也算）而 `knownFloors(key)` ≥ 2 → 读取失败（「服务器返回的内容是空的，而小锚上次存的是 N 楼」）。`knownFloors` 读 `chats` 表的 `lastCount`（最近一份快照的楼数），读库最多等 0.8 秒，读不到按不知道算（放行）。判定在把结果交还酒馆之前做完，所以酒馆紧接着发的开场白保存一定撞上未确认标记（第 2 条）。第 4 条的「再次读取成功」也改成响应体验证通过之后才算。别的插件发了请求却不读响应体的，60 秒后按成功算。
+8. **读取期间的空保存**（v1.2.12，`emptyDuringLoad`）：`S.loading` 记着每个 key 正在进行的读取（发出请求 → 响应体读完）。这期间当前聊天在内存里是空的，这时的保存请求放过去就是拿空聊天盖存档，一律拦下（记录「正在读取，内容还是空的」）。酒馆自己在 `clearChat` 里会取消排队中的保存，但别的扩展不会，小锚自己的补存定时器原来也不会。现在小锚自己发起的保存都先过 `canSaveNow(key)`（是当前聊天且 `chat.length > 0`）。
+9. 用户自己把楼删光（`MESSAGE_DELETED` 后只剩 0–1 楼）时不会再有新快照，这时把 `lastCount` 降下来。否则下次读取会被第 7 条当成「读出来是空的」，打开时也会误报掉楼。
+
+第 7 条的已知误伤：在别的设备上清空或删除过这个聊天，而这台设备的小锚还记得有楼 → 弹「没有读取成功」。弹窗里写了这种情况点「解除暂停」，再用快照恢复。
 
 **快照旁的「改了什么」**（v1.2.3）：用户看到同一楼数连着好几份快照（她没滑 swipe），问是不是正常。`describeChange()` 只比两份快照的哈希数组，在列表里写「+N」「改了第 N 楼」「只有聊天设置变了」；点一下 `showWhy()` → `diffSnaps()` 从 blob 里取出变了的楼逐字段比（`keysDiff`，`extra.*` 展开一层），弹窗列出字段名（`FIELD_NAMES` 翻成大白话），并判断是不是只有记账字段（`BOOKKEEPING`：token 计数、生成时间戳、lastInContextMessageId 等）。切后台触发的快照 reason 是 `hidden`，列表里标「切后台时」。调试入口 `ChatAnchor.diff(newId, oldId)`。
 
@@ -68,7 +77,17 @@ v1.2.5 起是**增量**的（用户的主聊天 48 MiB，每次全量 stringify 
 
 **标签段落**（v1.2.11）：用户的预设让模型把思考过程写在正文里，包在 `<灵魂梳理>…</灵魂梳理>` 这类自定义标签里。酒馆只在推理格式的前后缀正好设成这对标签且开了自动解析时才把它挪进 `extra.reasoning`，否则它就是正文的一部分，体检算正文、瘦身的「思维链」一项碰不到。`settings().slimTags`（字符串，逗号分隔，`parseTags()` 去掉尖括号/斜杠并去重）；`tagRegex(names)` 生成 `<(a|b)(?:\s[^>]*)?>[\s\S]*?</\1\s*>\n?`（第 1 组是标签名，缺结尾标签的不匹配）；`stripTagBlocks(str, re)` 返回 `{ out, n }`，段落在开头时把它留下的空行也去掉，去掉后正文空了返回 null（不留空楼）。`slimPlan` 多了 `tags`（名字数组，默认取设置）和 `dropTags`，`plan.tags = { names, floors, count, bytes }`；备选（`swipes.length > 1`）里的段落也算也清，只有一份副本的 swipes 不重复计（多半随「重复副本」一起删）。`slim()` 先删 swipes 再清标签段落，剩下的 swipes 也一起清。体检 `checkup()` 不认标签名，逐楼先用 `CLOSE_TAG_RE` 找出有结尾的标签名，再按这些名字配对（直接用通用正则会被 `<br>` 这类没结尾的标签拖成 O(n²)），返回 `tagStats`（按字节数前 5），报告和弹窗只列 10 KB 以上的。瘦身对话框第四行有输入框，`d.tagStats` 里 10 KB 以上的标签以小圆片列出，点一下填进去并重新计数（350ms 防抖），输入框内容无论确认还是取消都存进设置。t3 的 M14–M22 测这一段（每段约 5 KB，否则达不到 10 KB 的显示门槛）。
 
-**补存**：保存请求失败 → 记录状态码和响应体 → 3 / 8 / 20 秒后调 `ctx.saveChat()`。integrity 错误不重试，酒馆自己会弹窗。
+**v1.2.12 的瘦身改动**（用户说目前很稳、问有什么可改进，下面几条她点头后做的）：
+- **标签段落要先过预览**。1.2.11 的隐患：瘦身对话框把 `tagStats` 里的大标签都做成可点的按钮，`<content>` 这种故事正文也在里面，说明还把它们统称为思考过程，点错一下老楼的故事就被清了。现在 `plan.tags.per` 记每个标签的楼数、字节数和最靠后一楼的例子，`plan.tags.sample` 是那一楼删完剩下的正文；点「开始瘦身」后 `confirmTags()` 用 `tagPreviewHtml()` 先展示，「返回」回到瘦身对话框（同一个 DOM 元素重新弹，填的和勾的都还在）。`BODYISH`（content、正文、body、story…）这类名字不做成按钮，手填了在预览里红字提醒。体检的说明改成「正文由这些标签段落组成…故事本身那一段不要填」。
+- **副本只算酒馆不会补回去的楼**。瘦身完会重新读取，酒馆只显示最近 `power_user.chat_truncation` 楼（默认 100，0 = 全部；从 `ctx().powerUserSettings` 取），显示出来的楼马上被 `ensureSwipes` 补回副本。`shownFrom(total)` 算出显示的第一楼，`slimPlan` 里从这楼起的单份 swipes 记进 `dup.skipped`，不算、不删。之前这些楼删了又被补回，数字虚高，下面的提示也会永远不为零。
+- **字节数不重复计**。`plan.tags.bytes` 只算正文里的段落和不会被删的 swipes 里的；会随「重复副本」「备选」一起删的 swipes 里的段落记在 `tags.inDup` / `tags.inAlt`，那一项不清时才加进来（`slimTagBytes(plan, picks)`、`slimBytes(plan, picks)`）。用户会拿「清完约 A → B」和下一次体检对，所以要准。
+- **选项记忆**。`settings().slimLast = { dup, reasoning, alt, tags }` 只在确认并做完一次瘦身后写入（`runSlim`），对话框的默认勾选沿用它。`slimTags`（输入框预填）也改成真的用过之后才记，填了又取消的不留（之前是确认取消都存）。
+- **一步瘦身**。「当前」页体检按钮下有 `[data-slim-hint]`，`updateSlimHint()` 在面板画完后算（缓存在 `S.slimHint`，签名含聊天 key、楼数、显示范围、最新快照时间、选项，一分钟过期），可清的达到 `S.slimHintMin`（1 MiB）才显示。按钮 `slim-quick` → `quickSlim()`：有 `slimLast` 就只弹一个确认框（列出各项、带标签预览、可「改选项…」），没有就直接开瘦身对话框（这时没有体检结果，`scanTags()` 现算标签统计）。不做全自动：瘦身会改正文并重新读取聊天。
+t3 的 M1b、M10、M10b、M23–M32 测这些。
+
+**补存**：保存请求失败 → 记录状态码和响应体，`S.lastSave` 里记这一段连续失败的起点和次数（`{ ok: false, at, detail, status, since, fails }`）。`scheduleRetry`：先按 `S.retryQuick`（3 / 8 / 20 秒）试三次；还不行且 `isTransient(status)`（0 即网络错误、408、429、500、502、503、504）就按 `S.retrySlow`（1 / 2 / 5 分钟，之后一直 5 分钟，最多约两小时）慢慢试，每次先 `serverReachable()`（GET `/csrf-token`）探路，服务器没回来就不上传，免得把几十 MB 白传一遍；413、401、403、400 这类要人处理的不再自动试。回到页面（`visibilitychange`）和 `online` 事件也各触发一次（`retryIfFailing`）。integrity 错误不重试，酒馆自己会弹窗。
+
+**一直存不上时**（v1.2.12；起因是 413 那次用户只看到一条几秒就消失的提示，要翻「记录」才知道原因）：`saveStateChanged` 在第 4 次失败或失败满 30 秒后挂一条不消失的 toast（`S.saveToast`，点了打开面板，这一段失败期间不再弹）。面板顶部的 `[data-save-slot]` 里是常驻横幅（`saveBannerHtml`，哪一页都显示；`updateSaveBanner` 只改这一块，不重画面板，免得打断用户在设置页打字）：从几点起、试了几次、原因、怎么办、「现在再存一次」。`explainSave(ls)` 把状态码翻成大白话（`why` / `todo` / `refresh`）；只有 CSRF 失效（403 且响应里有 csrf）是必须刷新页面的。存上以后横幅和 toast 自动消失，记录里写「补存成功（之前 N 次没存上，前后约 M 分钟）」。
 
 **大请求体自动压缩**（v1.2.7）：2026-11-08 用户的保存全部 413——上个月改的 nginx 500m 被重置回 50m（1Panel 会重写 nginx.conf），聊天刚过 50 MiB。酒馆自己的 `compressRequest` 只压 `minPayloadSize`（256kb）到 `maxPayloadSize`（**默认 8mb**）之间的请求体，且 worker 3 秒超时，所以几十 MB 的聊天一直裸着发。服务器端是 `bodyParser.json({ limit: '500mb' })`，`inflate` 默认开，无条件接受 `Content-Encoding: gzip`。于是守门的保存分支改走 `sendSave()`：请求体是字符串（酒馆没压过）且超过 `S.gzipAbove`（4 MiB）就用 `CompressionStream('gzip')` 压一遍再发，头里加 `Content-Encoding: gzip`（`classify` 在压缩前已经从字符串里拿到了文件名）；服务器回 400/415 且不是 integrity 错误 → 置 `S.gzipBroken`，原样重发一次，之后不再压；任何异常都原样发。设置 `gzipSaves` 默认开。本机 43.3 MB 的测试聊天：压到 4.7 MB，压缩 + 本地上传共 1.5 秒（测试文本重复度高，真实聊天估计压到 15–25%）。注意「恢复成新聊天」走 multipart 的 `/api/chats/import`，压不了，大聊天在反代限制没放开前只能用「覆盖当前聊天」。
 
@@ -86,7 +105,7 @@ v1.2.5 起是**增量**的（用户的主聊天 48 MiB，每次全量 stringify 
 
 `importToCharacter()`：先切到目标角色再导入。酒馆第一次打开角色时才建聊天目录，目录不存在时 `/api/chats/import` 返回 200 + `{error:true}`。
 
-**调试入口**：`window.ChatAnchor`（`open / snapshot / list / stats / log / restoreInPlace / restoreAsNew / legacy / server / state`）。`state.srvTimeoutMs` 可以改超时（测试用）。
+**调试入口**：`window.ChatAnchor`（`open / snapshot / list / stats / log / restoreInPlace / restoreAsNew / checkup / slim / slimPlan / quickSlim / explainSave / canSaveNow / legacy / server / state`）。测试用的旋钮都在 `state` 上：`srvTimeoutMs`（服务器列表超时）、`retryQuick` / `retrySlow`（补存间隔）、`slimHintMin`（瘦身提示门槛）、`gzipAbove`。
 
 ## 不要破坏的约定
 
@@ -114,16 +133,16 @@ ST_DIR=~/st KEEP_ST=1 tests/run.sh t5
 
 `run.sh` 会把本仓库符号链接进 `$ST_DIR/public/scripts/extensions/third-party/st-chat-anchor`，端口上已有酒馆就直接用。每个脚本自己改 `settings.json`（跳过首次向导、决定小锚启不启用、清掉小锚自己的设置让每轮从默认值开始）、清掉 `data/<用户>/chats/default_Seraphina`。截图和日志在 `tests/out/`（已 gitignore）。
 
-- `stlib.py`：公共库。iPhone 视口 390×844 + 触摸；`Fault` 用 Playwright 路由让某个接口断网 / 返回指定状态码（回调里不能 sleep，会卡住同步 API）；`slow_fetch` 在页面里给 fetch 加延迟模拟慢服务器；磁盘聊天文件读写；`Checks` 计数。
-- `t1_rootcause.py`：不装小锚复现根因，两条路径（断网 reload / 502 openCharacterChat），10 项。
-- `t3_anchor.py`：A 自动快照，B 去重和跳过，C 断网读取失败，D 502 读取失败，I 第三方读取失败不误拦（含 21 秒等标记作废），E 保存失败补存，F 掉楼检测和覆盖恢复，G 恢复成新聊天，H 面板（含「改了什么」标签、弹窗、忽略字段），J 增量重算，K 大请求体自动压缩，L 体检，M 瘦身（含 M11/M13 重读慢、重读中 0 楼，M14–M22 标签段落），107 项。
+- `stlib.py`：公共库。iPhone 视口 390×844 + 触摸；`Fault` 用 Playwright 路由让某个接口断网 / 返回指定状态码和内容（回调里不能 sleep，会卡住同步 API）；`Hold` 把请求按住不放、调 `release()` 才放行（请求已经过了小锚的 fetch 包装，用来造「正在读取」的那几秒）；`slow_fetch` 在页面里给 fetch 加延迟模拟慢服务器（延迟发生在小锚的包装**之前**，这期间小锚还不知道有读取）；磁盘聊天文件读写；`Checks` 计数。
+- `t1_rootcause.py`：不装小锚复现根因，四个场景（断网 reload / 502 openCharacterChat / 200 + 空对象 / 200 但 JSON 不完整），16 项。
+- `t3_anchor.py`：A 自动快照，B 去重和跳过，C 断网读取失败，D 502 读取失败，I 第三方读取失败不误拦（含 21 秒等标记作废），E 保存失败补存，F 掉楼检测和覆盖恢复，G 恢复成新聊天，H 面板（含「改了什么」标签、弹窗、忽略字段），J 增量重算，K 大请求体自动压缩，L 体检，E 里还有一直存不上时的横幅、慢速补存、网络恢复时马上补存（E7–E14），N 读取期间的空保存，O 读取返回 200 但内容是空的 / 没读完（含两条不误伤：新聊天、用户自己删光），M 瘦身（含 M11/M13 重读慢、重读中 0 楼，M14–M22 标签段落，M23–M32 预览和一步瘦身），139 项，约 7 分钟。
 - `t4_legacy.py`：旧插件备份救援，8 项。
 - `t5_server.py`：服务器备份页。前 7 项是 1.2.0 的（中文文件名角色卡 `韩川央.png` 自动复制、跑完删掉），然后是 1.2.1 的慢服务器不卡面板 / 只发一个请求，1.2.2 的刷新页面后直接用记住的列表 / 504 给处理办法，最后是超时提示保留旧列表，21 项。
 - `t6_group.py`：群聊根因复现 + 守门（断网、502 两条路径）+ 掉楼 + 两种恢复，33 项，约 3 分钟。用户说群聊优先级低，但代码已经验证过能跑。
 - `t7_compression.py`：酒馆开了 `requestCompression` 时的守门、补存、覆盖恢复，以及酒馆压过的请求体小锚不重复压，14 项。要另起一个实例：`ST_COMPRESS=1 ST_PORT=8124 ST_DATA=/tmp/st-data2 ST_DIR=~/st tests/run.sh t7`（run.sh 会从 default/config.yaml 生成开了压缩、minPayloadSize 2kb 的配置）。
 - `t8_perf.py`：几千楼的性能基线，只打印数字，阈值很宽。`FLOORS=5000 tests/run.sh t8`。
 
-注意事项：`/send`、`/sendas`、`/cut` 用来模拟发消息、回复、删楼（走 `ctx.executeSlashCommandsWithOptions`）。角色卡 PNG 里记着「当前聊天名」，酒馆打开角色时按它建聊天，所以导入类检查要按 `ctx.chatId` 核对文件，不能数目录里的文件。toast 会盖住面板顶部的页签，计时的点击要先 `toastr.remove()`。路由回调里不能对 gzip 请求体读 `post_data`（会抛 UnicodeDecodeError，请求就永远不放行）。**不要挂 `page.on('request'/'response')`**：Playwright 会把每个请求的请求体整个传给 Python，几十 MB 的聊天保存一次就让 `evaluate` 卡 30 秒，测出来的时间全是假的（`stlib.Console` 因此只挂 console 和 pageerror）。
+注意事项：`/send`、`/sendas`、`/cut` 用来模拟发消息、回复、删楼（走 `ctx.executeSlashCommandsWithOptions`）。角色卡 PNG 里记着「当前聊天名」，酒馆打开角色时按它建聊天，所以导入类检查要按 `ctx.chatId` 核对文件，不能数目录里的文件。toast 会盖住面板顶部的页签，计时的点击要先 `toastr.remove()`。路由回调里不能对 gzip 请求体读 `post_data`（会抛 UnicodeDecodeError，请求就永远不放行）。**路由回调只在 Python 正在调 Playwright 的时候才执行**：还有请求没处理完时要等，用 `pg.wait_for_timeout()`，不能用 `time.sleep()`（那几秒里被拦的请求会一直挂着，回调的计数也不会动）。**不要挂 `page.on('request'/'response')`**：Playwright 会把每个请求的请求体整个传给 Python，几十 MB 的聊天保存一次就让 `evaluate` 卡 30 秒，测出来的时间全是假的（`stlib.Console` 因此只挂 console 和 pageerror）。
 
 ## 没做和没验证的
 
@@ -133,16 +152,16 @@ ST_DIR=~/st KEEP_ST=1 tests/run.sh t5
 4. 400 的来源：见上面「用户的服务器环境」，不再追。
 5. `requestCompression` 已验证（`tests/t7_compression.py`，13 项）：请求体确实是 gzip（看到 Content-Encoding 和 1f8b 魔数），守门退回"当前聊天"后不误拦、断网仍拦、覆盖恢复能确认保存成功、补存正常。
 6. 性能基线（`tests/t8_perf.py`，3000 楼、角色楼带 2 个 swipe、7.8MB 文件，本机 Chromium 141）：酒馆打开 1.4 秒；小锚首次快照把全部楼层写进 IndexedDB 再花 1.7 秒（期间最长的长任务 360ms，含酒馆自己的渲染）；之后内容没变的重算 127ms、改一楼 114ms（含整理），都没有 >50ms 的长任务；连续 15 份快照平均 132ms/份，13 份快照共 3012 个 blob、约 8.3MB；恢复成新聊天 3.1 秒、覆盖恢复 3.2 秒；面板打开 226ms。手机上没量过，预计慢 3–5 倍。
-7. 上游报告：草稿在 `docs/upstream-bug-report.md`，还没发到 SillyTavern 的 issues。
+7. 上游报告：草稿在 `docs/upstream-bug-report.md`，还没发到 SillyTavern 的 issues。2026-11-12 把「请求返回 200 也会盖掉存档」的两种情况写进去了。发之前要先在最新版酒馆上重新验证，草稿由她去贴（这个会话碰不了上游仓库）。
 8. 小海螺（ipe）每次重载/切后台重写正文且内容不一样，导致小锚不停存快照、酒馆不停往服务器存。要在小海螺的仓库里改成幂等（见上面「改了什么」一段）。可用 `ChatAnchor.diff(newId, oldId)` 验证改完后两次注入是否还有差异。用户说 Image Atelier 已在另一个会话里改过。
    2026-11-09 体检「钟小叶」887 楼 19.8 MB：正文 15.9 MB 里 `<draw>` 段落 9.9 MB（439 楼，每条回复约 22 KB，是小海螺让模型写在正文里的画图指令），`<content>` 5.2 MB 才是故事本身；`extra.ipe_inject_layers` 1.9 MB。清 `<draw>` 前让她去小海螺那边确认三件事：显示已生成的图不依赖正文里的 `<draw>`、重载/切聊天不再往 mes/swipes 里重写、以后画图指令生成完就从正文收走并把大数据放自己的文件。2026-11-12 用户说都处理好了（这边没验证）。之后她在瘦身里填 `draw` 清老楼；清完再体检，若 `<draw>` 的数字又长回来就是重写没改干净。
 9. 50 MB 的聊天：v1.2.5 改成增量重算（见「快照」一段）。用户 2026-11-09 实测瘦身：843 楼 55.3 MB → 30.5 MB，压缩后上传 22.1 → 10.6 MB；swipe 副本 15.6 → 0.8 MB（剩的是最近 50 楼 + 渲染过的），思维链 2.8 → 0.13 MB。生图插件和小海螺的数据（约 15 MB）还在，等它们迁移。
 10. 大聊天基线（`FLOORS=824 WORDS=1500 EXTRA_KB=40 tests/run.sh t8`，43.3 MB，本机 Chromium）：改前没变化重算 458 ms（27.5 MB 时）、每份快照 400 ms；改后没变化重算 17 ms、改一楼 17 ms、连续 15 份平均 31 ms/份。首次打开仍要全量：酒馆打开 2.5 秒 + 小锚首次快照 1.3 秒。`loadSnapData` 改成按 chatKey 整批 `getAll` 再挑，43 MB 读出来 0.37 秒（原来逐楼 get）。覆盖恢复 6.7 秒，其中酒馆自己的上传 3.5 秒 + 重载 2.3 秒；恢复成新聊天 3.8 秒。之前测出的「35 秒」是测试工具的假象（见测试注意事项）。
-11. 2026-11-12 用户说目前很稳，问还有什么可改进的。下面是提给她的建议，**等她点头再做**：
-    - **标签段落的隐患（v1.2.11 留下的，优先）**：瘦身对话框把 `tagStats` 里 10 KB 以上的标签都做成可点的按钮，`<content>` 这种故事正文也在里面；体检弹窗在这份列表下面写的是「预设让模型写在正文里的思考过程之类」。用户点错就会清掉老楼的故事，主要靠锁定的「瘦身前」快照救。打算：开始前拿一楼做真实例子，显示会删哪段、剩哪段；把这句说明改准确。
-    - 保存一直失败时在面板顶部挂常驻横幅（多久没存上、原因翻成大白话、该怎么办）。现在只有一条会消失的 toast 和「记录」页，413 那次她就是翻记录才知道原因。
-    - 「当前」页直接显示老楼里可清多少，加一个按钮按上次的选项瘦身。不做全自动（会改正文并重读聊天）。
-    - 上游报告（第 7 条）：发之前先在最新版酒馆上重新验证，草稿由她去贴。
+11. 2026-11-12 用户说目前很稳，问还有什么可改进的。提了六条建议，她说「听哥哥的」，1.2.12 做了前三条（标签段落预览、存不上时的横幅、一步瘦身），做的过程中又发现并补了守门的两个洞（第 7、8 条）。**还没做的**：
+    - 上游报告（第 7 条）。
     - 瘦身可选清老楼里别的扩展留下的 `extra.*`（要她先确认那些扩展不再读老楼里的数据）。
-    - 设置页显示 `navigator.storage.persisted()` 的结果（启动时已调 `persist()`，但没告诉用户浏览器答没答应）；请她在 iPhone 上试一次导出。
-    顺带核对过：自动锁定的快照（掉楼前 / 恢复前 / 瘦身前）在 `chooseKeep` 里只护最新 8 份，她每次瘦身攒下的「瘦身前」不会无限增长；`online` 事件触发补存、切后台存快照也都已经有了。
+    - 设置页显示 `navigator.storage.persisted()` 的结果（启动时已调 `persist()`，但没告诉用户浏览器答没答应）。
+    - 请她在 iPhone 上试一次导出（`navigator.share`）。
+    顺带核对过：自动锁定的快照（掉楼前 / 恢复前 / 瘦身前）在 `chooseKeep` 里只护最新 8 份，她每次瘦身攒下的「瘦身前」不会无限增长。
+12. 1.2.12 守门第 7 条在用户的真实环境里还没遇到过触发（刚发布）。如果她或她的用户看到「没有读取成功…服务器返回的内容是空的」的弹窗，让她把「记录」页复制过来：要分清是服务器真读不出文件（酒馆日志里会有报错）、还是误伤（在别处清空过聊天）。
+13. `restoreInPlace` 仍然用 `!c.chat.length` 判断「正在重新读取」。聊天真的是空的（没有开场白的角色、被清空的聊天）时没法覆盖恢复，只能用「恢复成新聊天」。可以改成看 `S.loading`，没动。

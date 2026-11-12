@@ -12,7 +12,7 @@
  */
 
 const EXT = 'chat_anchor';
-const VERSION = '1.2.11'; // 和 manifest.json 保持一致（测试会核对）
+const VERSION = '1.2.12'; // 和 manifest.json 保持一致（测试会核对）
 const TAG = '[小锚]';
 const DB_NAME = 'ST_ChatAnchor';
 const DB_VER = 1;
@@ -49,8 +49,14 @@ const S = {
     known: { key: null, set: new Set() },  // 当前聊天已入库的楼层哈希
     last: new Map(),                       // key -> { sig, ts }
     poison: new Map(),                     // key -> { at, confirmed, okSeen, released, detail }
-    lastSave: new Map(),                   // key -> { ok, at, detail }
+    lastSave: new Map(),                   // key -> { ok, at } 或 { ok: false, at, detail, status, since, fails }：since/fails 是这一段连续没存上的起点和次数
     retry: { key: null, n: 0, timer: null, toasted: false },
+    retryQuick: [3000, 8000, 20000],       // 没存上后先快速试这几次（毫秒）
+    retrySlow: [60000, 120000, 300000],    // 还不行且是临时故障：按这个间隔慢慢试，最后一个值一直用下去
+    saveToast: null,                       // 一直没存上时挂着的那条提示 { key, el }
+    loading: new Map(),                    // key -> 正在进行的读取请求数（读取期间的空聊天不许存，也不自己发起保存）
+    slimHint: null,                        // 「当前」页瘦身提示的缓存 { sig, at, bytes, parts }
+    slimHintMin: 1048576,                  // 老楼里可清的超过这么多才在「当前」页提示
     msgCache: new WeakMap(),               // 消息对象 -> { fp, hash, sig, len }：大聊天只重算变过的楼
     gzipAbove: 4 * 1048576,                // 保存请求体超过这个字节数就由小锚压缩（酒馆自己只压 8 MB 以下的）
     gzipBroken: false,                     // 服务器不认压缩的请求体：这个会话内不再压
@@ -75,6 +81,7 @@ function settings() {
     for (const k of Object.keys(DEFAULTS)) if (s[k] === undefined) s[k] = DEFAULTS[k];
     if (!Array.isArray(s.ignore)) s.ignore = []; // 判断"有没有变"时跳过的字段，如 extra.stImageAtelier、meta.variables
     if (typeof s.slimTags !== 'string') s.slimTags = '';
+    if (!s.slimLast || typeof s.slimLast !== 'object') s.slimLast = null; // 上一次确认并做完的瘦身选项 { dup, reasoning, alt, tags }
     return s;
 }
 
@@ -392,6 +399,8 @@ async function onChatChanged() {
     const info = currentChat();
     const count = ctx().chat.length; // 先同步记下楼数，后面都是异步
     for (const k of [...S.poison.keys()]) if (!info || k !== info.key) S.poison.delete(k);
+    if (S.saveToast && S.saveToast.key !== info?.key) clearSaveToast();
+    S.slimHint = null;
     if (!info) return;
 
     const p = S.poison.get(info.key);
@@ -442,8 +451,9 @@ function showLoadFailed(info, p) {
         const c = ctx();
         const html = `<div class="ca-dialog">
             <h3>这个聊天没有读取成功</h3>
-            <p>读取「${esc(info.chatName)}」时连接失败${p.detail ? `（${esc(p.detail)}）` : ''}。屏幕上现在是空的或只剩开场白，服务器上的存档没有被改动。</p>
+            <p>「${esc(info.chatName)}」没有读出来${p.detail ? `（${esc(p.detail)}）` : ''}。屏幕上现在是空的或只剩开场白，服务器上的存档没有被改动。</p>
             <p>为了不让开场白盖掉存档，小锚已暂停保存这个聊天。重新读取成功后会自动恢复正常。</p>
+            ${/内容是空的/.test(p.detail || '') ? '<p class="ca-note">如果重新读取几次都这样：要么服务器这会儿读不出文件，过一会儿再试；要么服务器上的存档真的已经空了（比如在别的设备上清空过）。后一种情况点「解除暂停」，再到小锚里用快照恢复。</p>' : ''}
         </div>`;
         const res = await c.callGenericPopup(html, c.POPUP_TYPE.TEXT, '', {
             okButton: '重新读取', cancelButton: '稍后再说',
@@ -528,51 +538,174 @@ function onLoadSettled(info, ok, detail) {
 /** 记录里显示聊天文件名，不显示内部键 */
 const nameOf = key => String(key || '').split('|').pop() || '未知聊天';
 
-function onBlocked(info) {
-    logEvent('守门', `拦下一次保存：「${nameOf(info.key)}」还没读取成功`);
+/**
+ * 聊天正在读取、内存里还是空的，这时候的保存请求里没有任何楼层，放过去就是拿空聊天盖掉服务器上的存档。
+ * 酒馆自己在清空聊天时会取消排队中的保存，但别的扩展（以及小锚自己的补存定时器）不一定。
+ */
+function emptyDuringLoad(info) {
+    return !!settings().guard && !!info.key && info.key === info.cur && (S.loading.get(info.key) || 0) > 0 && ctx().chat.length === 0;
+}
+
+function onBlocked(info, loading = false) {
+    logEvent('守门', loading ? `拦下一次保存：「${nameOf(info.key)}」正在读取，内容还是空的` : `拦下一次保存：「${nameOf(info.key)}」还没读取成功`);
     if (Date.now() - S.blockToastAt > 8000) {
         S.blockToastAt = Date.now();
-        toast('warning', '聊天还没读取成功，这次保存已拦下，服务器上的存档没有被覆盖。');
+        toast('warning', loading ? '聊天还在读取，这次保存已拦下，服务器上的存档没有被动。' : '聊天还没读取成功，这次保存已拦下，服务器上的存档没有被覆盖。');
     }
+}
+
+// ───────────────────────── 保存失败：记账、说人话、补存 ─────────────────────────
+/** 值得隔一会儿再试的失败：断网、服务器没响应。413、403 这类要人处理的，试多少次都一样 */
+const isTransient = status => [0, 408, 429, 500, 502, 503, 504].includes(status);
+
+/** 把保存失败翻成大白话：why 是原因，todo 是该怎么办，refresh 表示只有刷新页面才能好 */
+function explainSave(ls) {
+    const status = Number(ls?.status) || 0;
+    const detail = String(ls?.detail || '');
+    const auto = settings().retrySave ? '小锚会隔几分钟自动再试，恢复后自动补存，不用做什么。' : '恢复后点下面的「现在再存一次」。';
+    if (/"integrity"/.test(detail)) return { why: '服务器上的这个聊天被别的设备或别的标签页改过，酒馆为了防止互相覆盖拦下了保存', todo: '按酒馆弹出的提示处理。拿不准就先点右上角「立即快照」。' };
+    if (!status) return { why: '连不上服务器，可能是手机断网、信号差，或者服务器没开', todo: auto };
+    if (status === 413) {
+        return { why: '聊天整份上传太大，被服务器前面的反代拒绝了（HTTP 413）',
+            todo: settings().gzipSaves && typeof CompressionStream === 'function' && !S.gzipBroken
+                ? '先点「体检」做一次瘦身，再点下面的按钮。根治要把反代的上传上限调大（nginx 的 client_max_body_size）。'
+                : '到「设置」里打开「大聊天保存时压缩」，再点下面的按钮。还不行就先「体检」瘦身。' };
+    }
+    if (status === 401) return { why: '服务器要求重新登录（HTTP 401）', todo: '新开一个标签页打开酒馆登录一次，再回到这里点下面的按钮。' };
+    if (status === 403 && /csrf/i.test(detail)) return { why: '这个页面的登录凭证失效了（HTTP 403）', todo: '只有刷新页面才能恢复。刷新前先点右上角「立即快照」，刷新后如果少了内容，回到小锚用最新的快照恢复。', refresh: true };
+    if (status === 403) return { why: '服务器拒绝了这次保存（HTTP 403），可能是登录过期或被安全设置拦了', todo: '新开一个标签页看酒馆还能不能正常打开，再回到这里点下面的按钮。' };
+    if (status === 400) return { why: '服务器说收到的内容不对（HTTP 400），多半是请求在半路被代理或网关弄坏了', todo: '点下面的按钮再试一次。一直这样就到「记录」页点「复制记录」，发给帮你看的人。' };
+    if (status === 500) return { why: '酒馆服务器内部出错（HTTP 500），常见的是服务器磁盘满了或文件写不进去', todo: `去服务器上看酒馆的日志。${auto}` };
+    if (status === 502 || status === 503 || status === 504) return { why: `服务器没有响应（HTTP ${status}），酒馆可能在重启或者没开`, todo: auto };
+    return { why: `保存被拒绝（HTTP ${status}）`, todo: '点下面的按钮再试一次。一直这样就到「记录」页点「复制记录」，发给帮你看的人。' };
+}
+
+/** 小锚自己发起的保存（补存、回到页面、手动按钮）只在聊天确实在内存里的时候做。酒馆重新读取时会先把聊天清空，所以空着就不存 */
+function canSaveNow(key) {
+    return !!key && currentChat()?.key === key && ctx().chat.length > 0;
+}
+
+/** 小锚记得这个聊天有几楼（最近一份快照的楼数）。读库最多等 0.8 秒，读不到就当不知道 */
+async function knownFloors(key) {
+    try {
+        const rec = await Promise.race([dbGet('chats', key), sleep(800).then(() => null)]);
+        return Number(rec?.lastCount) || 0;
+    } catch { return 0; }
+}
+
+/** 先探一下服务器在不在，免得把几十 MB 传给一个没开的服务器 */
+async function serverReachable() {
+    try { return (await fetch('/csrf-token', { cache: 'no-store' })).ok; } catch { return false; }
+}
+
+function clearSaveToast() {
+    const t = S.saveToast;
+    S.saveToast = null;
+    try { if (t?.el) globalThis.toastr?.clear?.(t.el); } catch { /* 已经消失 */ }
+}
+
+/** 保存状态变了：更新面板顶部的横幅；快速重试用完还没存上，就挂一条不会自己消失的提示 */
+function saveStateChanged(key) {
+    try {
+        updateSaveBanner();
+        const ls = S.lastSave.get(key);
+        const failing = ls && !ls.ok && key === currentChat()?.key;
+        if (!failing) { if (S.saveToast?.key === key) clearSaveToast(); return; }
+        if (S.saveToast?.key === key || /"integrity"/.test(ls.detail)) return; // 已经挂过了；完整性问题酒馆自己会弹窗
+        if (ls.fails < 4 && Date.now() - ls.since < 30000) return;              // 先让快速重试试完
+        clearSaveToast();
+        const mark = { key, el: null };
+        S.saveToast = mark;
+        mark.el = globalThis.toastr?.warning?.(`「${nameOf(key)}」一直没能存到服务器：${explainSave(ls).why}。点这里看怎么办。`, '小锚',
+            { timeOut: 0, extendedTimeOut: 0, onclick: () => { mark.el = null; openPanel('cur'); } }) || null; // 点过以后这一段不再弹，标记留着
+    } catch (e) { warn(e); }
+}
+
+function saveBannerHtml() {
+    const info = currentChat();
+    const ls = info && S.lastSave.get(info.key);
+    if (!ls || ls.ok) return '';
+    const x = explainSave(ls);
+    const day = fmtDay(ls.since);
+    return `<div class="ca-banner" data-save-banner><b>这个聊天从${day === '今天' ? '' : ` ${day}`} ${fmtTime(ls.since)} 起就没能存到服务器</b>（试了 ${ls.fails} 次）。
+        <div>原因：${esc(x.why)}。</div>
+        <div>怎么办：${esc(x.todo)}</div>
+        <div class="ca-note">${x.refresh ? '没存上的内容在小锚的快照里。' : '这段时间的内容都在小锚的快照里，没有丢。先别刷新页面。'}</div>
+        <div class="ca-banner-acts"><div class="menu_button" data-act="save-now">现在再存一次</div></div></div>`;
+}
+
+/** 只改横幅那一块，不重画整个面板（用户可能正在设置页打字） */
+function updateSaveBanner() {
+    const slot = P.root?.querySelector('[data-save-slot]');
+    if (!slot) return;
+    const html = saveBannerHtml();
+    if (P.saveHtml !== html) { P.saveHtml = html; slot.innerHTML = html; }
 }
 
 function onSaveSettled(info, resp, err) {
     const key = info.key;
     if (resp?.ok) {
+        const prev = S.lastSave.get(key);
         S.lastSave.set(key, { ok: true, at: Date.now() });
-        if (S.retry.key === key && S.retry.n > 0) {
-            logEvent('补存', `「${nameOf(key)}」补存成功`);
-            if (S.retry.toasted) toast('success', '刚才没存上的内容已经补存到服务器。');
+        if (prev && !prev.ok) { // 一段没存上的时间结束了
+            const mins = Math.max(1, Math.round((Date.now() - prev.since) / 60000));
+            logEvent('补存', `「${nameOf(key)}」补存成功（之前 ${prev.fails} 次没存上，前后约 ${mins} 分钟）`);
+            if ((S.retry.key === key && S.retry.toasted) || S.saveToast?.key === key) toast('success', '刚才没存上的内容已经补存到服务器。');
         }
         if (S.retry.key === key) { clearTimeout(S.retry.timer); S.retry = { key: null, n: 0, timer: null, toasted: false }; }
+        saveStateChanged(key);
         return;
     }
-    const finish = detail => {
-        S.lastSave.set(key, { ok: false, at: Date.now(), detail });
-        if (/"integrity"/.test(detail)) { logEvent('保存失败', `「${nameOf(key)}」完整性校验未通过（酒馆会自己弹窗处理）`); return; }
+    const finish = (detail, status) => {
+        const prev = S.lastSave.get(key);
+        const cont = !!prev && !prev.ok;
+        S.lastSave.set(key, { ok: false, at: Date.now(), detail, status, since: cont ? prev.since : Date.now(), fails: cont ? prev.fails + 1 : 1 });
+        if (/"integrity"/.test(detail)) { logEvent('保存失败', `「${nameOf(key)}」完整性校验未通过（酒馆会自己弹窗处理）`); saveStateChanged(key); return; }
         logEvent('保存失败', `「${nameOf(key)}」${detail}`);
         if (key && key === currentChat()?.key) {
             takeSnapshot('auto').catch(warn); // 确保没存上的内容至少在本地有一份
-            scheduleRetry(key, detail);
+            scheduleRetry(key, detail, status);
         }
+        saveStateChanged(key);
     };
-    if (resp) resp.clone().text().then(t => finish(`HTTP ${resp.status} ${t.slice(0, 200)}`), () => finish(`HTTP ${resp.status}`));
-    else finish(`网络错误 ${err?.message || err}`);
+    if (resp) resp.clone().text().then(t => finish(`HTTP ${resp.status} ${t.slice(0, 200)}`, resp.status), () => finish(`HTTP ${resp.status}`, resp.status));
+    else finish(`网络错误 ${err?.message || err}`, 0);
 }
 
-function scheduleRetry(key, detail) {
+/**
+ * 补存。先快速试三次（3 / 8 / 20 秒）；还不行的话，断网、服务器没响应这类临时故障改成隔几分钟试一次，
+ * 每次先探一下服务器在不在（不白传几十 MB），最多两小时。413、403 这类要人处理的不再自动试。
+ */
+function scheduleRetry(key, detail, status) {
     if (!settings().retrySave) return;
     if (S.retry.key !== key) { clearTimeout(S.retry.timer); S.retry = { key, n: 0, timer: null, toasted: false }; }
     const r = S.retry;
-    if (!r.toasted) { r.toasted = true; toast('warning', `这次没能存到服务器（${detail.slice(0, 80)}）。内容已在本地快照里，稍后自动重试。`, { timeOut: 8000 }); }
-    const delays = [3000, 8000, 20000];
-    if (r.n >= delays.length) { logEvent('补存', `「${nameOf(key)}」重试 ${delays.length} 次仍失败，等下次保存`); return; }
+    if (!r.toasted) { r.toasted = true; toast('warning', `这次没能存到服务器：${explainSave({ status, detail }).why}。内容已在本地快照里，稍后自动重试。`, { timeOut: 8000 }); }
+    const quick = S.retryQuick, slow = S.retrySlow;
+    let delay, probe = false;
+    if (r.n < quick.length) delay = quick[r.n];
+    else {
+        if (!r.logged) { r.logged = true; logEvent('补存', `「${nameOf(key)}」重试 ${quick.length} 次仍失败，${isTransient(status) ? '之后隔几分钟再试' : '等下次保存'}`); }
+        if (!isTransient(status) || r.n >= quick.length + 26) return;
+        delay = slow[Math.min(r.n - quick.length, slow.length - 1)];
+        probe = true;
+    }
     clearTimeout(r.timer);
     r.timer = setTimeout(async () => {
-        if (currentChat()?.key !== key) return;
+        if (S.retry !== r || currentChat()?.key !== key) return;
         r.n++;
+        if (!canSaveNow(key) || (probe && !(await serverReachable()))) return scheduleRetry(key, detail, status); // 聊天正在读取，或者服务器还没回来：过会儿再看
         try { await ctx().saveChat(); } catch (e) { warn(e); }
-    }, delays[r.n]);
+    }, delay);
+}
+
+/** 回到页面、网络恢复时：这个聊天还有没存上的内容就马上再试一次 */
+function retryIfFailing(why) {
+    const key = currentChat()?.key;
+    const ls = key && S.lastSave.get(key);
+    if (!ls || ls.ok || !settings().retrySave || /"integrity"/.test(ls.detail) || !canSaveNow(key)) return;
+    if (why !== 'online' && (!isTransient(ls.status) || Date.now() - ls.at < 15000)) return;
+    serverReachable().then(ok => { if (ok && canSaveNow(key)) return ctx().saveChat(); }).catch(warn);
 }
 
 function installFetchGuard() {
@@ -583,10 +716,10 @@ function installFetchGuard() {
         try { info = classify(input, init); } catch { info = null; }
         if (!info) return orig.apply(this, arguments);
         if (info.op === 'save') {
-            let block = false;
-            try { block = shouldBlock(info); } catch { block = false; }
+            let block = false, loading = false;
+            try { block = shouldBlock(info); if (!block) block = loading = emptyDuringLoad(info); } catch { block = false; }
             if (block) {
-                try { onBlocked(info); } catch { /* 记录失败不影响拦截 */ }
+                try { onBlocked(info, loading); } catch { /* 记录失败不影响拦截 */ }
                 return Promise.resolve(new Response('{"error":"chat_anchor_guard"}', { status: 409, statusText: 'Blocked by Chat Anchor', headers: { 'Content-Type': 'application/json' } }));
             }
             const p = sendSave(this, arguments, input, init, info);
@@ -594,12 +727,56 @@ function installFetchGuard() {
             return p;
         }
         const p = orig.apply(this, arguments);
-        p.then(r => { try { onLoadSettled(info, r.ok, `HTTP ${r.status}`); } catch (e) { warn(e); } },
-            e => { try { if (e?.name !== 'AbortError') onLoadSettled(info, false, e?.message || String(e)); } catch (e2) { warn(e2); } });
+        try { trackLoad(info, p); } catch (e) { warn(e); }
         return p;
     };
     globalThis.fetch = wrapped;
     globalThis.__chatAnchorFetch = true;
+
+    /**
+     * 盯住一次读取，直到内容真的被读完。只看、不改响应内容，任何异常都不影响酒馆自己读。
+     * - 从发出请求到响应体读完，记在 S.loading 里：这段时间内存里的聊天是空的，不许存（见 emptyDuringLoad）。
+     * - 请求失败、非 2xx → 读取失败（原来就有）。
+     * - 响应头是 200，但内容下到一半断了、或者不是完整的 JSON（json() 抛错）→ 读取失败。
+     * - 内容读出来一楼都没有，而小锚记得这个聊天有 2 楼以上 → 也当读取失败：
+     *   酒馆服务器读文件时出任何异常都是返回 200 + 空对象。
+     * 后两种酒馆都会当成"空聊天"，塞进开场白存回去，把原文件盖掉。
+     */
+    function trackLoad(info, p) {
+        const key = info.key;
+        S.loading.set(key, (S.loading.get(key) || 0) + 1);
+        let open = true;
+        const end = () => { if (!open) return; open = false; const n = (S.loading.get(key) || 1) - 1; if (n > 0) S.loading.set(key, n); else S.loading.delete(key); };
+        const settle = (ok, detail) => { end(); try { onLoadSettled(info, ok, detail); } catch (e) { warn(e); } };
+        p.then(r => {
+            try {
+                if (!r.ok) return settle(false, `HTTP ${r.status}`);
+                let started = false, seen = false;
+                const judge = async (value, isText) => { // 读完了：读出来的是不是空的
+                    if (seen) return;
+                    seen = true;
+                    try {
+                        const rows = isText ? (String(value).trim().length > 2 ? 1 : 0) : (Array.isArray(value) ? value.length - (info.kind === 'c' ? 1 : 0) : 0); // 角色聊天第一行是文件头
+                        if (rows > 0) return settle(true, '');
+                        const known = await knownFloors(key);
+                        if (known >= 2) settle(false, `服务器返回的内容是空的，而小锚上次存的是 ${known} 楼`); else settle(true, '');
+                    } catch (e) { warn(e); settle(true, ''); }
+                };
+                for (const name of ['json', 'text']) {
+                    const real = r[name];
+                    if (typeof real !== 'function') continue;
+                    r[name] = async function (...args) {
+                        started = true;
+                        let value;
+                        try { value = await real.apply(r, args); } catch (e) { if (!seen) { seen = true; settle(false, `内容没读完（${e?.message || e}）`); } throw e; }
+                        await judge(value, name === 'text');
+                        return value;
+                    };
+                }
+                setTimeout(() => { if (!started && !seen) { seen = true; settle(true, ''); } }, 60000); // 一直没人读响应体（不是酒馆在读）：按读到了算
+            } catch (e) { warn(e); settle(true, ''); }
+        }, e => { if (e?.name === 'AbortError') end(); else settle(false, e?.message || String(e)); });
+    }
 
     /**
      * 发保存请求。请求体太大就先 gzip：酒馆自己只压 8 MB 以下的（config 里 maxPayloadSize 默认 8mb，超时 3 秒），
@@ -924,21 +1101,10 @@ async function checkup() {
             }
         }
         heavy.push({ index: i, bytes: total, top: topKey, topBytes: topN });
-        if (typeof m?.mes === 'string' && m.mes.includes('</')) { // 先找有结尾的标签名，再按名字配对，免得 <br> 这类没结尾的标签让正则扫到底
-            const closers = new Set();
-            for (const x of m.mes.matchAll(CLOSE_TAG_RE)) closers.add(x[1]);
-            const re = tagRegex([...closers]);
-            const seen = new Set();
-            for (let x; re && (x = re.exec(m.mes));) {
-                const ts = tagMap.get(x[1]) || { name: x[1], floors: 0, count: 0, bytes: 0 };
-                ts.count++; ts.bytes += enc.encode(x[0]).byteLength;
-                if (!seen.has(x[1])) { seen.add(x[1]); ts.floors++; }
-                tagMap.set(x[1], ts);
-            }
-        }
+        countTagBlocks(m?.mes, tagMap, enc);
         if (performance.now() - t0 > 10) { await tick(); t0 = performance.now(); }
     }
-    const tagStats = [...tagMap.values()].sort((a, b) => b.bytes - a.bytes).slice(0, 5);
+    const tagStats = topTags(tagMap);
     const metaObj = c.chatMetadata ?? {};
     const metaJson = JSON.stringify(metaObj);
     const metaBytes = enc.encode(metaJson).byteLength;
@@ -971,7 +1137,7 @@ function checkupText(d) {
     if (d.meta.bytes > 10240) lines.push(`  ${String(pct(d.meta.bytes)).padStart(3)}%  ${fmtSize(d.meta.bytes).padStart(8)}  聊天设置（元数据）：${d.meta.fields.slice(0, 3).map(f => `${f.key} ${fmtSize(f.bytes)}`).join('，')}`);
     lines.push('最重的楼：' + d.heavy.map(h => `第 ${h.index + 1} 楼 ${fmtSize(h.bytes)}（${h.top}）`).join('、'));
     const bigTags = (d.tagStats || []).filter(t => t.bytes >= 10240);
-    if (bigTags.length) lines.push('正文里的标签段落：' + bigTags.map(t => `<${t.name}> ${fmtSize(t.bytes)}（${t.floors} 楼）`).join('、') + '。瘦身里填上标签名，可以清掉老楼里的这些段落。');
+    if (bigTags.length) lines.push('正文由这些标签段落组成：' + bigTags.map(t => `<${t.name}> ${fmtSize(t.bytes)}（${t.floors} 楼）`).join('、') + '。其中用完就没用的（画图指令、思考过程之类）可以在瘦身里填标签名清掉老楼里的；故事本身那一段不要填。');
     if (d.extBytes > d.bytes * 0.2) lines.push(`别的扩展写进楼里的数据占了 ${pct(d.extBytes)}%。让那个扩展把数据存到自己的文件里、楼里只留引用，文件就能瘦一大截。`);
     return lines.join('\n');
 }
@@ -985,7 +1151,7 @@ async function showCheckup(d) {
         <p>${d.count} 楼，整份 <b>${fmtSize(d.bytes)}</b>${d.gzBytes ? `，压缩后约 <b>${fmtSize(d.gzBytes)}</b>` : ''}。酒馆每次保存都整份上传这么多。</p>
         <p><b>什么占地方</b></p><ol class="ca-check">${rows}</ol>
         <p><b>最重的楼</b>：${d.heavy.map(h => `第 ${h.index + 1} 楼 ${fmtSize(h.bytes)}（${esc(h.top)}）`).join('、')}</p>
-        ${(d.tagStats || []).some(t => t.bytes >= 10240) ? `<p><b>正文里的标签段落</b>：${d.tagStats.filter(t => t.bytes >= 10240).map(t => `&lt;${esc(t.name)}&gt; ${fmtSize(t.bytes)}（${t.floors} 楼）`).join('、')}<br><small>预设让模型写在正文里的思考过程之类。「瘦身…」里填上标签名，可以清掉老楼里的这些段落。</small></p>` : ''}
+        ${(d.tagStats || []).some(t => t.bytes >= 10240) ? `<p><b>正文由这些标签段落组成</b>：${d.tagStats.filter(t => t.bytes >= 10240).map(t => `&lt;${esc(t.name)}&gt; ${fmtSize(t.bytes)}（${t.floors} 楼）`).join('、')}<br><small>哪段是故事本身、哪段是画图指令或思考过程这类用完就没用的，只有你知道。用完没用的可以在「瘦身…」里填标签名，清掉老楼里的；开始前会先给你看要删的是什么。故事本身那一段不要填。</small></p>` : ''}
         <p class="ca-note">楼数不是问题，每楼的重量才是。${d.extBytes > d.bytes * 0.2 ? `别的扩展写进楼里的数据占了 ${pct(d.extBytes)}%：让那个扩展把数据存到自己的文件里、楼里只留引用，文件就能瘦一大截。` : '这个聊天大部分是正文本身，没什么可卸的包袱。'}</p></div>`;
     const res = await c.callGenericPopup(html, c.POPUP_TYPE.TEXT, '', { okButton: '关闭', cancelButton: false, allowVerticalScrolling: true, customButtons: [{ text: '复制报告', result: 2 }, { text: '瘦身…', result: 3 }] });
     if (res === 3) return showSlim(d);
@@ -1011,61 +1177,134 @@ function tagRegex(tags) {
     if (!tags?.length) return null;
     return new RegExp(`<(${tags.map(escRe).join('|')})(?:\\s[^>]*)?>[\\s\\S]*?</\\1\\s*>\\n?`, 'g');
 }
-/** 去掉正文里的标签段。返回 { out, n }；没匹配到、或整楼只有这一段（去掉就空了）返回 null */
-function stripTagBlocks(str, re) {
+/**
+ * 去掉正文里的标签段。返回 { out, n }；没匹配到、或整楼只有这一段（去掉就空了）返回 null。
+ * onHit(name, block)：真的会删的每一段调一次，预览和分项统计用。
+ */
+function stripTagBlocks(str, re, onHit) {
     if (typeof str !== 'string' || !re) return null;
     re.lastIndex = 0;
     const first = re.exec(str);
     if (!first) return null;
     re.lastIndex = 0;
     let n = 0;
-    let out = str.replace(re, () => { n++; return ''; });
+    const hits = onHit ? [] : null;
+    let out = str.replace(re, (block, name) => { n++; if (hits) hits.push([name, block]); return ''; });
     if (!str.slice(0, first.index).trim()) out = out.replace(/^\s+/, ''); // 段落在开头：把它留下的空行也去掉
-    return out.trim() ? { out, n } : null;
+    if (!out.trim()) return null;
+    if (hits) for (const [name, block] of hits) onHit(name, block);
+    return { out, n };
 }
-const CLOSE_TAG_RE = /<\/([A-Za-z\u4e00-\u9fff][\w\u4e00-\u9fff:-]*)\s*>/g;
+const CLOSE_TAG_RE = /<\/([A-Za-z一-鿿][\w一-鿿:-]*)\s*>/g;
+/** 名字一看就是正文本身的标签：不做成可点的按钮，真填了要红字提醒 */
+const BODYISH = /^(content|正文|内容|body|main|story|text|reply|response|message|msg|剧情|故事|回复)$/i;
 
-/** 只算不改：老楼里能卸掉什么、各多少字节。opts 里的 drop* 决定哪些算进 targets。 */
-async function slimPlan(msgs, { keepRecent = SLIM_KEEP, dropDup = true, dropReasoning = true, dropAlternates = false, dropTags = false, tags = null } = {}) {
+/** 数一楼正文里有哪些 <标签>…</标签> 段落。不认标签名：先找有结尾的标签名，再按名字配对，免得 <br> 这类没结尾的标签让正则扫到底 */
+function countTagBlocks(mes, tagMap, enc) {
+    if (typeof mes !== 'string' || !mes.includes('</')) return;
+    const closers = new Set();
+    for (const x of mes.matchAll(CLOSE_TAG_RE)) closers.add(x[1]);
+    const re = tagRegex([...closers]);
+    const seen = new Set();
+    for (let x; re && (x = re.exec(mes));) {
+        const ts = tagMap.get(x[1]) || { name: x[1], floors: 0, count: 0, bytes: 0 };
+        ts.count++; ts.bytes += enc.encode(x[0]).byteLength;
+        if (!seen.has(x[1])) { seen.add(x[1]); ts.floors++; }
+        tagMap.set(x[1], ts);
+    }
+}
+const topTags = tagMap => [...tagMap.values()].sort((x, y) => y.bytes - x.bytes).slice(0, 5);
+/** 整个聊天的标签段落统计（体检里顺带做；不经过体检直接开瘦身对话框时单独跑一遍） */
+async function scanTags(msgs) {
+    const enc = new TextEncoder(), tagMap = new Map();
+    let t0 = performance.now();
+    for (const m of msgs) {
+        countTagBlocks(m?.mes, tagMap, enc);
+        if (performance.now() - t0 > 10) { await tick(); t0 = performance.now(); }
+    }
+    return topTags(tagMap);
+}
+
+/**
+ * 酒馆读完聊天后会显示出来的第一楼的下标。从这一楼起，酒馆一显示就调 ensureSwipes 把 swipes: [mes] 补回去，
+ * 清了也白清，所以「重复副本」只算、只清更早的楼。瘦身完会重新读取，显示的就是最近 chat_truncation 楼（0 = 全部）。
+ */
+function shownFrom(total) {
+    const n = ctx().powerUserSettings?.chat_truncation;
+    if (typeof n === 'number' && n >= 0) return n > 0 ? Math.max(0, total - n) : 0;
+    const first = Number(document.querySelector('#chat .mes')?.getAttribute('mesid'));
+    return Number.isInteger(first) && first >= 0 ? first : Math.max(0, total - 100);
+}
+
+/**
+ * 只算不改：老楼里能卸掉什么、各多少字节。opts 里的 drop* 决定哪些算进 targets。
+ * 各项的字节数互不重叠：tags.bytes 只算正文里的段落，加上一定会留下的 swipes 里的；会随「重复副本」「备选」一起删掉的
+ * swipes 里的段落记在 tags.inDup / tags.inAlt，那一项不清的时候才加进来（见 slimTagBytes）。
+ */
+async function slimPlan(msgs, { keepRecent = SLIM_KEEP, dropDup = true, dropReasoning = true, dropAlternates = false, dropTags = false, tags = null, shown = null } = {}) {
     const enc = new TextEncoder();
     const size = v => v === undefined ? 0 : enc.encode(JSON.stringify(v) ?? '').byteLength;
     const names = Array.isArray(tags) ? parseTags(tags.join(',')) : parseTags(settings().slimTags);
     const re = tagRegex(names);
     const end = Math.max(0, msgs.length - keepRecent);
-    const plan = { total: msgs.length, keepRecent, end, dup: { floors: 0, bytes: 0 }, alt: { floors: 0, bytes: 0, count: 0 }, reasoning: { floors: 0, bytes: 0 }, tags: { names, floors: 0, count: 0, bytes: 0 }, targets: [], bytes: 0 };
+    const from = Math.min(end, Number.isInteger(shown) ? shown : shownFrom(msgs.length));
+    const per = new Map(names.map(x => [x, { name: x, floors: 0, count: 0, bytes: 0, ex: null }]));
+    const plan = { total: msgs.length, keepRecent, end, shown: from,
+        dup: { floors: 0, bytes: 0, skipped: 0 }, alt: { floors: 0, bytes: 0, count: 0 }, reasoning: { floors: 0, bytes: 0 },
+        tags: { names, floors: 0, count: 0, bytes: 0, inDup: 0, inAlt: 0, per: [], sample: null }, targets: [], bytes: 0 };
     let t0 = performance.now();
     for (let i = 0; i < end; i++) {
         const m = msgs[i];
         if (!m || typeof m !== 'object') continue;
         const t = { i, dup: false, alt: false, reasoning: false, tags: false };
+        let sw = ''; // 这楼的 swipes 归哪类：alt 备选，dup 会被「重复副本」删掉，kept 酒馆会补回去所以不动
         if (Array.isArray(m.swipes)) {
-            if (m.swipes.length <= 1) { plan.dup.floors++; plan.dup.bytes += size(m.swipes) + size(m.swipe_info) + 24; t.dup = dropDup; }
-            else { plan.alt.floors++; plan.alt.count += m.swipes.length - 1; plan.alt.bytes += size(m.swipes) + size(m.swipe_info) + 24; t.alt = dropAlternates; }
+            if (m.swipes.length > 1) { sw = 'alt'; plan.alt.floors++; plan.alt.count += m.swipes.length - 1; plan.alt.bytes += size(m.swipes) + size(m.swipe_info) + 24; t.alt = dropAlternates; }
+            else if (i < from) { sw = 'dup'; plan.dup.floors++; plan.dup.bytes += size(m.swipes) + size(m.swipe_info) + 24; t.dup = dropDup; }
+            else { sw = 'kept'; plan.dup.skipped++; }
         }
         if (m.extra && typeof m.extra === 'object' && (m.extra.reasoning || m.extra.reasoning_duration != null)) {
             plan.reasoning.floors++; plan.reasoning.bytes += size(m.extra.reasoning) + size(m.extra.reasoning_duration) + size(m.extra.reasoning_type) + 40; t.reasoning = dropReasoning;
         }
         if (re) {
-            let n = 0, b = 0;
-            const r = stripTagBlocks(m.mes, re);
-            if (r) { n += r.n; b += size(m.mes) - size(r.out); }
-            if (Array.isArray(m.swipes) && m.swipes.length > 1) for (const sw of m.swipes) { const rs = stripTagBlocks(sw, re); if (rs) { n += rs.n; b += size(sw) - size(rs.out); } } // 只有一份副本的 swipes 多半随「重复副本」一起删，不重复计
-            if (n) { plan.tags.floors++; plan.tags.count += n; plan.tags.bytes += b; t.tags = dropTags; }
+            let n = 0;
+            const seen = new Set();
+            const r = stripTagBlocks(m.mes, re, (name, block) => {
+                const pt = per.get(name);
+                if (!pt) return;
+                pt.count++; pt.bytes += enc.encode(block).byteLength;
+                if (!seen.has(name)) { seen.add(name); pt.floors++; }
+                pt.ex = { index: i, block }; // 留最靠后的一楼做例子：离现在最近，用户最认得
+            });
+            if (r) { n += r.n; plan.tags.bytes += size(m.mes) - size(r.out); plan.tags.sample = { index: i, rest: r.out }; }
+            if (sw) for (const one of m.swipes) {
+                const rs = stripTagBlocks(one, re);
+                if (!rs) continue;
+                n += rs.n;
+                const saved = size(one) - size(rs.out);
+                if (sw === 'dup') plan.tags.inDup += saved; else if (sw === 'alt') plan.tags.inAlt += saved; else plan.tags.bytes += saved;
+            }
+            if (n) { plan.tags.floors++; plan.tags.count += n; t.tags = dropTags; }
         }
         if (t.dup || t.alt || t.reasoning || t.tags) plan.targets.push(t);
         if (performance.now() - t0 > 10) { await tick(); t0 = performance.now(); }
     }
-    plan.bytes = (dropDup ? plan.dup.bytes : 0) + (dropReasoning ? plan.reasoning.bytes : 0) + (dropAlternates ? plan.alt.bytes : 0) + (dropTags ? plan.tags.bytes : 0);
+    plan.tags.per = [...per.values()].filter(x => x.count);
+    plan.bytes = slimBytes(plan, { dup: dropDup, reasoning: dropReasoning, alt: dropAlternates, tags: dropTags });
     return plan;
 }
+/** 「标签段落」一项能清多少：swipes 要是随别的项一起删了，里面的段落就不再重复算 */
+const slimTagBytes = (plan, picks) => plan.tags.bytes + (picks.dup ? 0 : plan.tags.inDup) + (picks.alt ? 0 : plan.tags.inAlt);
+/** 按勾选的项算一共能清多少 */
+const slimBytes = (plan, picks) => (picks.dup ? plan.dup.bytes : 0) + (picks.reasoning ? plan.reasoning.bytes : 0) + (picks.alt ? plan.alt.bytes : 0) + (picks.tags ? slimTagBytes(plan, picks) : 0);
 
 /** 真正动手。先存一份锁定的「瘦身前」快照，改内存里的楼，保存成功才重新读取。dryRun 只返回计划。 */
 async function slim(opts = {}) {
-    const { dryRun = false, keepRecent = SLIM_KEEP, dropDup = true, dropReasoning = true, dropAlternates = false, dropTags = false, tags = null } = opts;
+    const { dryRun = false, keepRecent = SLIM_KEEP, dropDup = true, dropReasoning = true, dropAlternates = false, dropTags = false, tags = null, shown = null } = opts;
     const info = currentChat();
     if (!info) throw new Error('先打开一个聊天');
     if (!ctx().chat.length) throw new Error('聊天现在是空的，多半是还在重新读取。等它读完再瘦身');
-    const plan = await slimPlan(ctx().chat, { keepRecent, dropDup, dropReasoning, dropAlternates, dropTags, tags });
+    const plan = await slimPlan(ctx().chat, { keepRecent, dropDup, dropReasoning, dropAlternates, dropTags, tags, shown });
     if (dryRun || !plan.targets.length) return { ...plan, applied: 0, saved: null };
     const p = S.poison.get(info.key);
     if (p && p.confirmed && !p.okSeen && !p.released) throw new Error('这个聊天还没读取成功，请先点「重新读取」');
@@ -1082,10 +1321,11 @@ async function slim(opts = {}) {
         if (t.tags && re) {
             const r = stripTagBlocks(m.mes, re);
             if (r) m.mes = r.out;
-            if (Array.isArray(m.swipes)) m.swipes = m.swipes.map(sw => stripTagBlocks(sw, re)?.out ?? sw);
+            if (Array.isArray(m.swipes)) m.swipes = m.swipes.map(one => stripTagBlocks(one, re)?.out ?? one);
         }
     }
     S.forceFull = true; // 老楼变了，下一次快照全量重算
+    S.slimHint = null;
     const t0 = Date.now();
     await ctx().saveChat();
     const ls = S.lastSave.get(info.key);
@@ -1101,49 +1341,106 @@ async function slim(opts = {}) {
     return { ...plan, applied: plan.targets.length, saved };
 }
 
+/** 一段长文字掐头去尾，给人看个大概 */
+function excerpt(text, head = 90, tail = 30) {
+    const x = String(text ?? '').replace(/\s+/g, ' ').trim();
+    return x.length > head + tail + 8 ? `${x.slice(0, head)} …… ${x.slice(-tail)}` : x;
+}
+
+/** 标签段落的预览：每个标签举最靠后一楼的真实例子，再给出那一楼删完剩下什么。改正文之前必须让人亲眼看到 */
+function tagPreviewHtml(plan) {
+    const enc = new TextEncoder();
+    const inner = block => block.replace(/^<[^>]*>/, '').replace(/<\/[^>]*>\s*$/, '');
+    let html = '';
+    for (const pt of plan.tags.per) {
+        html += `<p><b>&lt;${esc(pt.name)}&gt;</b>：${pt.floors} 楼的正文里有，共 ${fmtSize(pt.bytes)}。比如第 ${pt.ex.index + 1} 楼会删掉这一段（${fmtSize(enc.encode(pt.ex.block).byteLength)}）：</p>
+            <blockquote class="ca-quote is-del">${esc(excerpt(inner(pt.ex.block)))}</blockquote>`;
+        if (BODYISH.test(pt.name)) html += `<p class="ca-danger">「${esc(pt.name)}」看名字像是正文本身。删了它，老楼里就只剩别的段落了。确定要删吗？</p>`;
+    }
+    if (!html) html = `<p>老楼的正文里没有这些段落，只在备选回复里有 ${plan.tags.count} 段，会一起清掉。</p>`;
+    if (plan.tags.sample) html += `<p>删完以后，第 ${plan.tags.sample.index + 1} 楼的正文剩下：</p><blockquote class="ca-quote">${esc(excerpt(plan.tags.sample.rest, 120, 40))}</blockquote>`;
+    return html;
+}
+
+async function confirmTags(plan) {
+    const c = ctx();
+    const html = `<div class="ca-dialog"><h3>先看一眼要删的是什么</h3>
+        <p>会从前 ${plan.end} 楼里删掉下面这些段落，一共 ${plan.tags.floors} 楼。删的是正文，清了就没了。</p>
+        ${tagPreviewHtml(plan)}
+        <p class="ca-note">拿不准就点「返回」。开始前会先存一份锁定快照「瘦身前」，后悔可以用它恢复。</p></div>`;
+    const res = await c.callGenericPopup(html, c.POPUP_TYPE.CONFIRM, '', { okButton: '就删这些，开始瘦身', cancelButton: '返回', allowVerticalScrolling: true });
+    return res === c.POPUP_RESULT.AFFIRMATIVE;
+}
+
+/** 真正开始瘦身（对话框和「按上次的选项」共用）：提示一直挂到重读完成；remember 时记住这次的选项 */
+async function runSlim(o, remember = true) {
+    const done = toastHold('正在瘦身，大聊天要几秒…保存后会重新读取一遍，读完才算完成。');
+    let r;
+    try { r = await slim({ dropDup: !!o.dup, dropReasoning: !!o.reasoning, dropAlternates: !!o.alt, dropTags: !!o.tags, tags: parseTags(o.tags) }); } finally { done(); }
+    if (remember) { // 记住这次确认并做完的选项；标签名只在真的用过之后才记（填了又取消的不留）
+        const st = settings();
+        st.slimLast = { dup: !!o.dup, reasoning: !!o.reasoning, alt: !!o.alt, tags: o.tags || '' };
+        if (o.tags) st.slimTags = o.tags;
+        ctx().saveSettingsDebounced();
+    }
+    S.slimHint = null;
+    if (!r.applied) toast('info', '老楼里没有可清的。');
+    else toast(r.saved === false ? 'warning' : 'success', `瘦身完成，清掉约 ${fmtSize(r.bytes)}${r.saved === false ? '，但服务器保存未确认' : ''}。`);
+    refreshPanel();
+    return r;
+}
+
+/** 瘦身对话框。d 是体检结果（从体检弹窗进来时有）；从「当前」页直接进来时没有，标签统计现算 */
 async function showSlim(d) {
     const c = ctx();
     const st = settings();
+    const info = currentChat();
+    if (!info) throw new Error('先打开一个聊天');
+    if (!c.chat.length) throw new Error('聊天现在是空的，多半是还在重新读取。等它读完再瘦身');
     const all = { keepRecent: SLIM_KEEP, dropDup: true, dropReasoning: true, dropAlternates: true, dropTags: true };
-    const plan = await slimPlan(ctx().chat, { ...all, tags: parseTags(st.slimTags) });
+    let plan = await slimPlan(c.chat, { ...all, tags: parseTags(st.slimTags) });
     const total = d?.bytes || 0;
     if (!plan.end) {
         await c.callGenericPopup(`<div class="ca-dialog"><h3>还不用瘦身</h3><p>最近 ${SLIM_KEEP} 楼一律不动，这个聊天只有 ${plan.total} 楼，没有更早的楼可以处理。</p></div>`, c.POPUP_TYPE.TEXT, '', { okButton: '关闭' });
         return null;
     }
+    const tagStats = d?.tagStats || await scanTags(c.chat);
+    const last = st.slimLast;
+    const picks = { dup: last ? !!last.dup : true, reasoning: last ? !!last.reasoning : true, alt: last ? !!last.alt : false, tags: plan.tags.floors > 0 && (last ? !!last.tags : true) };
     const el = document.createElement('div');
     el.className = 'ca-dialog';
-    const n = (bytes, floors) => `${fmtSize(bytes)} · ${floors} 楼`;
-    const row = (k, checked, title, note, bytes, floors) => `<label class="ca-row is-stack ca-slim-row"><span><b><input type="checkbox" data-slim="${k}" ${checked ? 'checked' : ''}> ${title}</b><small>${note}</small></span><span class="ca-slim-n" data-slim-n="${k}">${n(bytes, floors)}</span></label>`;
-    const chips = (d?.tagStats || []).filter(t => t.bytes >= 10240).slice(0, 5).map(t => `<span class="ca-chip" data-tag-chip="${esc(t.name)}">&lt;${esc(t.name)}&gt; ${fmtSize(t.bytes)}</span>`).join('');
-    el.innerHTML = `<h3>「${esc(d?.chatName || '')}」瘦身</h3>
+    const n = (bytes, floors) => floors ? `${fmtSize(bytes)} · ${floors} 楼` : '没有可清的';
+    const row = (k, title, note, bytes, floors) => `<label class="ca-row is-stack ca-slim-row"><span><b><input type="checkbox" data-slim="${k}" ${picks[k] ? 'checked' : ''}> ${title}</b><small>${note}</small></span><span class="ca-slim-n" data-slim-n="${k}">${n(bytes, floors)}</span></label>`;
+    const shownN = plan.total - shownFrom(plan.total);
+    const dupNote = plan.shown > 0
+        ? `酒馆给每条回复都多存了一份和正文一模一样的文本，去掉不丢任何内容。酒馆每次读取聊天，会给它显示出来的最近 ${shownN} 楼重新补上这份副本，所以这里只算更早的楼。以后翻回去看老楼，看到的那几楼也会被补回来`
+        : '酒馆给每条回复都多存了一份和正文一模一样的文本。但你的酒馆设置成一次显示全部楼层（用户设置里的「要加载 # 条消息」是 0），它会把每一楼的副本都补回去，这项现在清不掉。把那个数字改成 100 再来就能清';
+    const chips = tagStats.filter(t => t.bytes >= 10240 && !BODYISH.test(t.name)).slice(0, 5).map(t => `<span class="ca-chip" data-tag-chip="${esc(t.name)}">&lt;${esc(t.name)}&gt; ${fmtSize(t.bytes)}</span>`).join('');
+    el.innerHTML = `<h3>「${esc(d?.chatName || info.chatName)}」瘦身</h3>
         <p>最近 ${SLIM_KEEP} 楼一律不动，只处理前 ${plan.end} 楼。别的扩展写进楼里的数据不碰。</p>
         <p class="ca-note" data-slim-sum></p>
-        ${row('dup', true, '重复的 swipe 副本', '酒馆给每条回复都多存了一份和正文一模一样的文本，去掉不丢任何内容。以后翻回去看老楼时，酒馆会给看到的那几楼重新补上，所以这项对平时不翻的老楼最有效', plan.dup.bytes, plan.dup.floors)}
-        ${row('reasoning', true, '老楼的思维链', '模型的思考过程，不影响正文，老楼的没人回头看', plan.reasoning.bytes, plan.reasoning.floors)}
-        ${row('alt', false, '老楼里没被选中的备选回复', `共 ${plan.alt.count} 条。清了就看不到那些备选了，默认不清`, plan.alt.bytes, plan.alt.floors)}
-        <div class="ca-row is-stack ca-slim-row ca-slim-tags"><label><span><b><input type="checkbox" data-slim="tags" ${plan.tags.floors ? 'checked' : ''}> 老楼正文里的「标签段落」</b><small>预设让模型写在正文里的思考过程，比如 &lt;灵魂梳理&gt;…&lt;/灵魂梳理&gt;。填标签名，多个用逗号分开。缺结尾标签的、整楼只有这一段的不动。<b>这项会改老楼正文</b>，清了就没了</small></span><span class="ca-slim-n" data-slim-n="tags">${n(plan.tags.bytes, plan.tags.floors)}</span></label>
-            <input type="text" class="text_pole" data-slim-tags value="${esc(st.slimTags || '')}" placeholder="标签名，例如：灵魂梳理">${chips ? `<small>体检在正文里看到的标签，点一下填进去：${chips}</small>` : ''}</div>
+        ${row('dup', '重复的 swipe 副本', dupNote, plan.dup.bytes, plan.dup.floors)}
+        ${row('reasoning', '老楼的思维链', '模型的思考过程，不影响正文，老楼的没人回头看', plan.reasoning.bytes, plan.reasoning.floors)}
+        ${row('alt', '老楼里没被选中的备选回复', `共 ${plan.alt.count} 条。清了就看不到那些备选了，默认不清`, plan.alt.bytes, plan.alt.floors)}
+        <div class="ca-row is-stack ca-slim-row ca-slim-tags"><label><span><b><input type="checkbox" data-slim="tags" ${picks.tags ? 'checked' : ''}> 老楼正文里的「标签段落」</b><small>预设让模型写在正文里、用完就没用的段落，比如画图指令 &lt;draw&gt;…&lt;/draw&gt;、思考过程 &lt;灵魂梳理&gt;…&lt;/灵魂梳理&gt;。填标签名，多个用逗号分开。故事本身那一段不要填。缺结尾标签的、整楼只有这一段的不动。<b>这项会改老楼正文</b>，开始前会先给你看要删的是什么</small></span><span class="ca-slim-n" data-slim-n="tags"></span></label>
+            <input type="text" class="text_pole" data-slim-tags value="${esc(st.slimTags || '')}" placeholder="标签名，例如：draw">${chips ? `<small>正文里看到的标签，点一下填进去。只填用完就没用的：${chips}</small>` : ''}</div>
         <p class="ca-note">开始前会先存一份锁定快照「瘦身前」，后悔可以用它恢复。瘦身后会自动保存并重新读取。</p>`;
-    const picks = { dup: true, reasoning: true, alt: false, tags: plan.tags.floors > 0 };
     const input = el.querySelector('[data-slim-tags]');
     const sum = () => {
-        const b = (picks.dup ? plan.dup.bytes : 0) + (picks.reasoning ? plan.reasoning.bytes : 0) + (picks.alt ? plan.alt.bytes : 0) + (picks.tags ? plan.tags.bytes : 0);
-        el.querySelector('[data-slim-sum]').textContent = total ? `清完约 ${fmtSize(total)} → ${fmtSize(Math.max(0, total - b))}。` : `约可清掉 ${fmtSize(b)}。`;
+        el.querySelector('[data-slim-n="tags"]').textContent = n(slimTagBytes(plan, picks), plan.tags.floors);
+        const bytes = slimBytes(plan, { ...picks, tags: picks.tags && plan.tags.floors > 0 });
+        el.querySelector('[data-slim-sum]').textContent = !bytes ? '勾选的几项里现在没有可清的。' : total ? `清完约 ${fmtSize(total)} → ${fmtSize(Math.max(0, total - bytes))}。` : `一共约可清掉 ${fmtSize(bytes)}。`;
     };
-    let timer = null, seq = 0;
-    const recount = () => { // 标签名一变就重新数一遍，几十 MB 的聊天也只要几十毫秒
-        clearTimeout(timer);
-        timer = setTimeout(async () => {
-            const my = ++seq;
-            const p2 = await slimPlan(ctx().chat, { ...all, tags: parseTags(input.value) });
-            if (my !== seq) return;
-            plan.tags = p2.tags;
-            el.querySelector('[data-slim-n="tags"]').textContent = n(plan.tags.bytes, plan.tags.floors);
-            el.querySelector('[data-slim="tags"]').checked = picks.tags = plan.tags.floors > 0;
-            sum();
-        }, 350);
+    let timer = null, pending = null, seq = 0;
+    const recountNow = async () => { // 标签名一变就重新数一遍，几十 MB 的聊天也只要几十毫秒
+        const my = ++seq;
+        const p2 = await slimPlan(ctx().chat, { ...all, tags: parseTags(input.value) });
+        if (my !== seq) return;
+        plan = p2;
+        el.querySelector('[data-slim="tags"]').checked = picks.tags = plan.tags.floors > 0;
+        sum();
     };
+    const recount = () => { clearTimeout(timer); timer = setTimeout(() => { timer = null; pending = recountNow().catch(warn).finally(() => { pending = null; }); }, 350); };
     el.addEventListener('change', e => { const k = e.target?.dataset?.slim; if (k) { picks[k] = e.target.checked; sum(); } });
     el.addEventListener('input', e => { if (e.target === input) recount(); });
     el.addEventListener('click', e => {
@@ -1155,17 +1452,76 @@ async function showSlim(d) {
         recount();
     });
     sum();
-    const res = await c.callGenericPopup(el, c.POPUP_TYPE.CONFIRM, '', { okButton: '开始瘦身', cancelButton: '取消', allowVerticalScrolling: true });
-    clearTimeout(timer);
-    const tags = parseTags(input.value);
-    if (tags.join(', ') !== (st.slimTags || '')) { st.slimTags = tags.join(', '); c.saveSettingsDebounced(); } // 填过的标签名记住，下次不用再填
-    if (res !== c.POPUP_RESULT.AFFIRMATIVE || (!picks.dup && !picks.reasoning && !picks.alt && !picks.tags)) return null;
-    const done = toastHold('正在瘦身，大聊天要几秒…保存后会重新读取一遍，读完才算完成。');
-    let r;
-    try { r = await slim({ dropDup: picks.dup, dropReasoning: picks.reasoning, dropAlternates: picks.alt, dropTags: picks.tags, tags }); } finally { done(); }
-    toast(r.saved === false ? 'warning' : 'success', `瘦身完成，清掉约 ${fmtSize(r.bytes)}${r.saved === false ? '，但服务器保存未确认' : ''}。`);
-    refreshPanel();
-    return r;
+    for (;;) {
+        const res = await c.callGenericPopup(el, c.POPUP_TYPE.CONFIRM, '', { okButton: '开始瘦身', cancelButton: '取消', allowVerticalScrolling: true });
+        const go = res === c.POPUP_RESULT.AFFIRMATIVE;
+        if (timer) { clearTimeout(timer); timer = null; if (go) await recountNow(); } else if (pending) await pending; // 刚改完标签名就点了开始：先按最新的数完
+        if (!go) return null;
+        const tags = parseTags(input.value);
+        const useTags = picks.tags && plan.tags.floors > 0;
+        if (!picks.dup && !picks.reasoning && !picks.alt && !useTags) return null;
+        if (useTags && !await confirmTags(plan)) continue; // 「返回」：回到这个对话框接着改
+        return runSlim({ dup: picks.dup, reasoning: picks.reasoning, alt: picks.alt, tags: useTags ? tags.join(', ') : '' });
+    }
+}
+
+/** 「当前」页的一步瘦身：按上次确认过的选项，只确认一次。没用过瘦身就直接开对话框 */
+async function quickSlim() {
+    const c = ctx();
+    const last = settings().slimLast;
+    if (!last) return showSlim(null);
+    if (!currentChat()) throw new Error('先打开一个聊天');
+    if (!c.chat.length) throw new Error('聊天现在是空的，多半是还在重新读取。等它读完再瘦身');
+    const plan = await slimPlan(c.chat, { dropDup: !!last.dup, dropReasoning: !!last.reasoning, dropAlternates: !!last.alt, dropTags: !!last.tags, tags: parseTags(last.tags) });
+    const picks = { dup: !!last.dup, reasoning: !!last.reasoning, alt: !!last.alt, tags: !!last.tags && plan.tags.floors > 0 };
+    const items = slimParts(plan, picks, true);
+    if (!items.length) { toast('info', '按上次的选项，老楼里现在没有可清的。'); return null; }
+    const html = `<div class="ca-dialog"><h3>按上次的选项瘦身</h3>
+        <p>最近 ${SLIM_KEEP} 楼不动。前 ${plan.end} 楼里会清掉约 <b>${fmtSize(slimBytes(plan, picks))}</b>：</p>
+        <ul class="ca-list">${items.map(x => `<li>${x}</li>`).join('')}</ul>
+        ${picks.tags ? tagPreviewHtml(plan) : ''}
+        <p class="ca-note">开始前会先存一份锁定快照「瘦身前」，后悔可以用它恢复。瘦身后会自动保存并重新读取。</p></div>`;
+    const res = await c.callGenericPopup(html, c.POPUP_TYPE.CONFIRM, '', { okButton: '开始瘦身', cancelButton: '取消', allowVerticalScrolling: true, customButtons: [{ text: '改选项…', result: 2 }] });
+    if (res === 2) return showSlim(null);
+    if (res !== c.POPUP_RESULT.AFFIRMATIVE) return null;
+    return runSlim({ dup: picks.dup, reasoning: picks.reasoning, alt: picks.alt, tags: picks.tags ? last.tags : '' }, false);
+}
+
+/** 按勾选的项列出各能清多少。detail 为真时带字节数（确认框用），否则只写楼数（提示用）。返回的是 HTML 片段 */
+function slimParts(plan, picks, detail) {
+    const out = [];
+    const b = n => detail ? `，${fmtSize(n)}` : '';
+    if (picks.dup && plan.dup.floors) out.push(`重复的 swipe 副本 ${plan.dup.floors} 楼${b(plan.dup.bytes)}`);
+    if (picks.reasoning && plan.reasoning.floors) out.push(`思维链 ${plan.reasoning.floors} 楼${b(plan.reasoning.bytes)}`);
+    if (picks.alt && plan.alt.floors) out.push(`备选回复 ${plan.alt.count} 条${b(plan.alt.bytes)}`);
+    if (picks.tags && plan.tags.floors) out.push(`${plan.tags.names.map(x => `&lt;${esc(x)}&gt;`).join(' ')} 段落 ${plan.tags.floors} 楼${b(slimTagBytes(plan, picks))}`);
+    return out;
+}
+
+/**
+ * 「当前」页的瘦身提示：老楼里按上次的选项（没用过就按默认）现在能清多少，超过 S.slimHintMin 才显示。
+ * 面板画完以后再算，算完只改那一小块；同一个聊天、楼数没变的话一分钟内不重算。
+ */
+async function updateSlimHint() {
+    const info = currentChat();
+    if (!info || !P.root?.querySelector('[data-slim-hint]')) return;
+    const c = ctx();
+    if (!c.chat.length) return;
+    const last = settings().slimLast;
+    const o = last || { dup: true, reasoning: true, alt: false, tags: '' };
+    const sig = [info.key, c.chat.length, shownFrom(c.chat.length), S.last.get(info.key)?.ts || 0, JSON.stringify(o)].join('|'); // 存过新快照（内容变了）就重算
+    let h = S.slimHint;
+    if (!h || h.sig !== sig || Date.now() - h.at > 60000) {
+        const plan = await slimPlan(c.chat, { dropDup: !!o.dup, dropReasoning: !!o.reasoning, dropAlternates: !!o.alt, dropTags: !!o.tags, tags: parseTags(o.tags) });
+        const picks = { dup: !!o.dup, reasoning: !!o.reasoning, alt: !!o.alt, tags: !!o.tags && plan.tags.floors > 0 };
+        h = S.slimHint = { sig, at: Date.now(), bytes: slimBytes(plan, picks), parts: slimParts(plan, picks, false) };
+    }
+    const slot = P.root?.querySelector('[data-slim-hint]');
+    if (!slot || currentChat()?.key !== info.key) return;
+    slot.innerHTML = h.bytes >= S.slimHintMin && h.parts.length
+        ? `<div class="ca-hint">老楼里攒了约 <b>${fmtSize(h.bytes)}</b> 可以清：${h.parts.join('、')}。
+            <div class="ca-banner-acts"><div class="menu_button" data-act="slim-quick">${last ? '按上次的选项瘦身' : '瘦身…'}</div></div></div>`
+        : '';
 }
 
 // ───────────────────────── 两份快照差在哪 ─────────────────────────
@@ -1449,7 +1805,7 @@ async function serverRestore(file, { ask = true } = {}) {
 }
 
 // ───────────────────────── 面板 ─────────────────────────
-const P = { popup: null, root: null, tab: 'cur', viewKey: null, srvKey: undefined, busy: false, again: false, srvTick: null };
+const P = { popup: null, root: null, tab: 'cur', viewKey: null, srvKey: undefined, busy: false, again: false, srvTick: null, saveHtml: '' };
 const REASON = { manual: '手动', drop: '掉楼前', 'pre-restore': '恢复前', 'pre-slim': '瘦身前', hidden: '切后台时' };
 const z2 = n => String(n).padStart(2, '0');
 const fmtTime = ts => { const d = new Date(ts); return `${z2(d.getHours())}:${z2(d.getMinutes())}`; };
@@ -1504,14 +1860,17 @@ async function render() {
     const tabs = [['cur', '当前'], ['all', '全部'], ['srv', '服务器'], ['log', '记录'], ['set', '设置']];
     const scroller = root.closest('.popup-content') || root.parentElement;
     const top = scroller?.scrollTop ?? 0;
+    P.saveHtml = saveBannerHtml();
     root.innerHTML = `
         <header class="ca-head">
             <div class="ca-title"><i class="fa-solid fa-anchor"></i><span>小锚</span><small class="ca-by" title="由 Claude（Anthropic）和江一起做的">by Claude</small></div>
             <div class="menu_button" data-act="snap-now" title="给当前聊天存一份并锁定">立即快照</div>
         </header>
+        <div data-save-slot>${P.saveHtml}</div>
         <nav class="ca-tabs" role="tablist">${tabs.map(([id, label]) => `<button type="button" class="ca-tab" role="tab" aria-selected="${P.tab === id}" data-act="tab" data-tab="${id}">${label}</button>`).join('')}</nav>
         <section class="ca-body">${body}</section>`;
     if (scroller) scroller.scrollTop = top;
+    updateSlimHint().catch(warn); // 页面上有提示位才会算
 }
 
 async function renderTimeline(key, info, withBack) {
@@ -1522,7 +1881,7 @@ async function renderTimeline(key, info, withBack) {
     const owner = rec?.owner || info?.owner || '';
     const chatName = rec?.chatName || info?.chatName || '';
     let html = `${back}<div class="ca-chat-name">${esc(owner)}</div><div class="ca-chat-file">${esc(chatName)}${isCur ? '' : '（不是当前打开的聊天）'}</div>`;
-    if (isCur) html += '<button type="button" class="ca-back" data-act="checkup"><i class="fa-solid fa-stethoscope"></i>体检：这个聊天多大、什么占的</button>';
+    if (isCur) html += '<button type="button" class="ca-back" data-act="checkup"><i class="fa-solid fa-stethoscope"></i>体检：这个聊天多大、什么占的</button><div data-slim-hint></div>';
 
     const p = S.poison.get(key);
     if (isCur && p && p.confirmed && !p.okSeen && !p.released) {
@@ -1721,6 +2080,14 @@ async function onPanelClick(e) {
     if (act === 'view') { P.viewKey = el.dataset.key; return refreshPanel(); }
     if (act === 'reload') { await closePanel(); return ctx().reloadCurrentChat(); }
     if (act === 'checkup') { toast('info', '正在体检，大聊天要几秒…', { timeOut: 2500 }); return showCheckup(await checkup()); }
+    if (act === 'slim-quick') return quickSlim();
+    if (act === 'save-now') {
+        const key = currentChat()?.key;
+        if (!canSaveNow(key)) return toast('info', '聊天正在读取或者是空的，等它读完再存。');
+        toast('info', '正在保存…', { timeOut: 2000 });
+        await ctx().saveChat(); // 成功、失败都由保存结果那边更新横幅和提示
+        return;
+    }
     if (act === 'snap-now') {
         if (!currentChat()) return toast('info', '先打开一个聊天。');
         const snap = await takeSnapshot('manual', { force: true, lock: true });
@@ -1862,11 +2229,20 @@ function start() {
         ev.MESSAGE_SWIPED, ev.MESSAGE_SWIPE_DELETED, ev.MESSAGE_REASONING_EDITED, ev.MESSAGE_REASONING_DELETED]) {
         on(name, id => { mark(id); schedule(1200); });
     }
-    on(ev.MESSAGE_DELETED, () => { S.forceFull = true; schedule(1200); });
+    on(ev.MESSAGE_DELETED, () => {
+        S.forceFull = true; schedule(1200);
+        // 删到只剩 0–1 楼时不会再有新快照（空聊天不存），小锚记的楼数要跟着降：
+        // 否则下次读取会被当成"读出来是空的"，打开时也会误报掉楼
+        const info = currentChat(), n = ctx().chat.length;
+        if (info && n <= 1) enqueue(async () => { const rec = await dbGet('chats', info.key); if (rec && rec.lastCount > n) await dbPut('chats', { ...rec, lastCount: n }); }).catch(warn);
+    });
     // 切到后台前立刻存一份：手机上页面随时可能被系统回收
-    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden' && settings().enabled) { clearTimeout(S.timer); S.timer = null; takeSnapshot('hidden').catch(warn); } });
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden' && settings().enabled) { clearTimeout(S.timer); S.timer = null; takeSnapshot('hidden').catch(warn); }
+        if (document.visibilityState === 'visible') { try { retryIfFailing('visible'); } catch (e) { warn(e); } }
+    });
     window.addEventListener('pagehide', () => { if (S.timer) { clearTimeout(S.timer); S.timer = null; takeSnapshot('hidden').catch(warn); } });
-    window.addEventListener('online', () => { const k = currentChat()?.key; const ls = k && S.lastSave.get(k); if (ls && !ls.ok && settings().retrySave) ctx().saveChat(); });
+    window.addEventListener('online', () => { try { retryIfFailing('online'); } catch (e) { warn(e); } });
 
     try { navigator.storage?.persist?.().catch(() => { }); } catch { /* 不支持就算了 */ }
     setTimeout(() => maintenance().catch(warn), 20000);
@@ -1888,7 +2264,7 @@ globalThis.ChatAnchor = {
     list: async key => snapsOf(key || currentChat()?.key),
     stats: async () => ({ chats: (await dbAll('chats')).length, snaps: (await dbAll('snaps')).length, blobs: (await blobKeysOf(currentChat()?.key)).length }),
     log: () => dbAll('log'),
-    diff: diffSnaps, loadSnapData, getSnap, checkup, checkupText, slim, slimPlan: opts => slimPlan(ctx().chat, opts),
+    diff: diffSnaps, loadSnapData, getSnap, checkup, checkupText, slim, slimPlan: opts => slimPlan(ctx().chat, opts), quickSlim, explainSave, canSaveNow,
     legacy: { list: legacyList, importAsNew: legacyImport, exportFile: legacyExport },
     server: { list: serverBackups, restore: serverRestore, keyOf: backupKeyOf, sha256: sha256Hex },
     state: S,

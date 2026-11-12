@@ -6,6 +6,11 @@ t1_rootcause.py — 不装小锚时复现丢楼根因。
   场景 1  reloadCurrentChat：chat_metadata 不重置，带着旧 integrity
   场景 2  openCharacterChat：chat_metadata 被重置成 {}
 预期：两种情况磁盘上的 301 楼都变成 1 楼，而且没有弹窗、没有报错提示。
+
+读取请求"成功"（HTTP 200）也会走到同一个结局（1.2.12 发现）：
+  场景 3  响应是空对象。服务器的 /api/chats/get 读文件时出任何异常都 catch 掉，返回 200 + {}；
+          客户端把非数组当成"空的或损坏的聊天文件"，清空 chat，同样进 getChatResult()。
+  场景 4  响应体下到一半断了 / JSON 不完整：response.json() 抛错，进 catch，和场景 1 一样。
 """
 import sys
 import time
@@ -60,6 +65,30 @@ def main():
         f.remove()
         C.ok(L.chat_len(pg) == 1, '页面上只剩开场白 1 楼', f'len={L.chat_len(pg)}')
         C.ok(L.floors(NAME) == 1, '磁盘上的 301 楼存档又被覆盖成 1 楼', f'floors={L.floors(NAME)}')
+        C.ok(no_ui_noise(pg), '没有弹窗，也没有错误提示')
+
+        C.section('场景 3：读取返回 200，但内容是空对象（服务器读文件出异常时就返回这个）')
+        L.write_chat(NAME, 301)
+        L.open_chat(pg, NAME)
+        C.ok(L.chat_len(pg) == 301, '重新写回 301 楼并打开')
+        f = L.Fault(pg, '**/api/chats/get', mode=200, body='{}')
+        L.ev(pg, 'ctx.reloadCurrentChat().catch(() => {});')
+        L.wait_js(pg, 'ctx.chat.length === 1', timeout=20000)
+        pg.wait_for_timeout(2500)
+        f.remove()
+        C.ok(f.hits >= 1 and L.chat_len(pg) == 1 and L.floors(NAME) == 1, '请求明明"成功"了，磁盘上的 301 楼照样被覆盖成 1 楼', f'hits={f.hits} len={L.chat_len(pg)} floors={L.floors(NAME)}')
+        C.ok(no_ui_noise(pg), '没有弹窗，也没有错误提示')
+
+        C.section('场景 4：读取返回 200，但内容下到一半断了（JSON 不完整）')
+        L.write_chat(NAME, 301)
+        L.open_chat(pg, NAME)
+        C.ok(L.chat_len(pg) == 301, '重新写回 301 楼并打开')
+        f = L.Fault(pg, '**/api/chats/get', mode=200, body='[{"chat_metadata":{}},{"name":"Seraphina","is_user":false,"mes":"下到一半就断')
+        L.ev(pg, 'ctx.reloadCurrentChat().catch(() => {});')
+        L.wait_js(pg, 'ctx.chat.length === 1', timeout=20000)
+        pg.wait_for_timeout(2500)
+        f.remove()
+        C.ok(f.hits >= 1 and L.chat_len(pg) == 1 and L.floors(NAME) == 1, '内容没读完，磁盘上的 301 楼同样被覆盖成 1 楼', f'hits={f.hits} len={L.chat_len(pg)} floors={L.floors(NAME)}')
         C.ok(no_ui_noise(pg), '没有弹窗，也没有错误提示')
 
         print('\n酒馆控制台里和聊天有关的报错：')

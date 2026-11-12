@@ -115,3 +115,10 @@
 .ca-slim-row span > b { display: flex; align-items: center; gap: 6px; }
 .ca-slim-tags > small { color: var(--ca-muted); font-size: .85em; line-height: 1.7; }
 .ca-chip { display: inline-block; padding: 0 8px; margin: 0 4px 2px 0; border: 1px solid var(--SmartThemeBorderColor, currentColor); border-radius: 10px; cursor: pointer; white-space: nowrap; }
+.ca-quote { margin: 4px 0 10px; padding: 6px 10px; border-left: 3px solid var(--ca-line, currentColor); background: color-mix(in srgb, currentColor 6%, transparent); font-size: .9em; line-height: 1.5; overflow-wrap: anywhere; opacity: .9; }
+.ca-quote.is-del { border-left-color: var(--ca-danger, #d64545); }
+.ca-danger { color: var(--ca-danger, #d64545); font-weight: 600; }
+.ca-list { margin: 0 0 8px; padding-left: 1.2em; }
+.ca-list li { margin: 2px 0; }
+.ca-hint { margin: 4px 0 2px; padding: 8px 10px; border-left: 3px solid var(--ca-accent); background: var(--ca-faint); border-radius: 0 6px 6px 0; line-height: 1.5; font-size: .92em; }
+.ca-banner .ca-note { margin: 6px 0 0; }
